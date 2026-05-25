@@ -268,23 +268,38 @@ impl ShmRegion {
     /// 销毁共享内存区域（服务端调用）。
     ///
     /// 解除映射、关闭文件描述符、删除共享内存名称。
-    pub fn destroy(self) -> MinosResult<()> {
-        let ret = unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.size) };
+    /// 调用后 Drop 不会再重复释放资源。
+    pub fn destroy(mut self) -> MinosResult<()> {
+        // 保存值用于手动清理
+        let ptr = self.ptr;
+        let size = self.size;
+        let shm_fd = self.shm_fd;
+        let name = std::mem::take(&mut self.name);
+
+        // 标记为已销毁，防止 Drop 重复释放
+        self.ptr = std::ptr::null_mut();
+        self.shm_fd = -1;
+
+        // 手动 drop self 以触发 Drop（此时 ptr=null, fd=-1，Drop 无操作）
+        drop(self);
+
+        // 现在安全地清理实际资源
+        let ret = unsafe { libc::munmap(ptr as *mut libc::c_void, size) };
         if ret != 0 {
             log::warn!("munmap failed: {}", io::Error::last_os_error());
         }
 
-        let ret = unsafe { libc::close(self.shm_fd) };
+        let ret = unsafe { libc::close(shm_fd) };
         if ret != 0 {
             log::warn!("close shm_fd failed: {}", io::Error::last_os_error());
         }
 
-        let cname = CString::new(self.name.as_str()).unwrap();
+        let cname = CString::new(name.as_str()).unwrap();
         let ret = unsafe { libc::shm_unlink(cname.as_ptr()) };
         if ret != 0 {
             log::warn!(
                 "shm_unlink '{}' failed: {}",
-                self.name,
+                name,
                 io::Error::last_os_error()
             );
         }

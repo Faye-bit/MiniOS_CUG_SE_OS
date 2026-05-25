@@ -180,11 +180,31 @@ fn main() {
     }
 
     log::info!("Shutting down...");
-    if let Ok(state) = Arc::try_unwrap(state) {
-        let mut state = state.into_inner().unwrap();
-        state.store.flush().ok();
-        let _ = state.region.destroy();
+
+    // 首先关闭 listener，停止接受新连接
+    drop(listener);
+    // 短暂等待活动的工作线程完成
+    std::thread::sleep(Duration::from_millis(200));
+
+    // 尝试解锁 state 并清理
+    match Arc::try_unwrap(state) {
+        Ok(mutex) => {
+            let mut inner = mutex.into_inner().unwrap();
+            inner.store.flush().ok();
+            let _ = inner.region.destroy();
+            log::info!("Store flushed and shared memory destroyed.");
+        }
+        Err(arc) => {
+            // 仍有活跃引用，通过 lock 强制清理
+            log::warn!("Some client threads still active, forcing cleanup...");
+            if let Ok(mut inner) = arc.lock() {
+                inner.store.flush().ok();
+            }
+            // 注意：此时无法安全 destroy region（其他线程可能还在使用），
+            // 但进程退出后内核会自动回收共享内存
+        }
     }
+
     let _ = std::fs::remove_file(&args.socket_path);
     daemon::remove_pidfile(&args.pidfile);
     log::info!("MinOS server stopped.");
