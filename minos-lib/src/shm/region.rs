@@ -1,16 +1,14 @@
 //! 共享内存区域（ShmRegion）— POSIX 共享内存生命周期管理。
-//!
-//! 使用 `shm_open` + `mmap` 创建/打开共享内存区域，
-//! 将控制头、页分配位图、请求/响应槽位与数据页组织在连续内存中。
 
 use crate::common::consts;
 use crate::common::error::{MinosError, MinosResult};
 use std::ffi::CString;
 use std::io;
 
-/// 跨进程共享的控制头，位于共享内存区域开头（Page 0）。
+/// 跨进程共享的控制头，位于共享内存区域 Page 0 的开头。
 ///
-/// 记录区域几何信息、页分配状态、请求/响应队列元数据。
+/// **布局说明**：控制头 ~48 字节，不填充到整页。位图、请求/响应槽位、
+/// 互斥锁等紧随其后，全部放在 4096 字节的控制页内。数据页从 Page 1 开始。
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct ShmControlHeader {
@@ -20,11 +18,11 @@ pub struct ShmControlHeader {
     pub version: u32,
     /// 单个数据页大小（字节），固定 4096
     pub page_size: u32,
-    /// 数据页总数
+    /// 数据页总数（不含控制页）
     pub total_pages: u32,
     /// 当前空闲页数
     pub free_pages: u32,
-    /// 页分配位图偏移量（从 header 起始计算）
+    /// 页分配位图偏移量（从控制页起始计算）
     pub page_bitmap_offset: u32,
     /// 页分配位图大小（字节）
     pub page_bitmap_size: u32,
@@ -34,19 +32,14 @@ pub struct ShmControlHeader {
     pub request_slots_offset: u32,
     /// 响应槽位偏移量
     pub response_slots_offset: u32,
-    /// 互斥锁偏移量
+    /// 互斥锁偏移量（8 字节对齐）
     pub mutex_offset: u32,
     /// 单个请求/响应槽位大小（字节）
     pub slot_size: u32,
-    /// 保留字段，填充至控制页边界（4096 - 48 header bytes = 4048）
-    pub _reserved: [u8; 4048],
 }
 
-// 编译期大小检查
-const _: () = assert!(std::mem::size_of::<ShmControlHeader>() == consts::SHM_PAGE_SIZE as usize);
-
 impl ShmControlHeader {
-    /// 创建新的控制头。
+    /// 创建新的控制头。`total_pages` 为数据页数量。
     pub fn new(
         total_pages: u32,
         page_bitmap_offset: u32,
@@ -54,13 +47,11 @@ impl ShmControlHeader {
         max_requests: u32,
         slot_size: u32,
     ) -> Self {
-        // 计算各区偏移
         let request_slots_offset = page_bitmap_offset + page_bitmap_size;
         let response_slots_offset = request_slots_offset + max_requests * slot_size;
-        let mut mutex_offset = response_slots_offset + max_requests * slot_size;
-
-        // 将互斥锁偏移量对齐到 8 字节边界
-        mutex_offset = (mutex_offset + 7) / 8 * 8;
+        let mutex_offset = response_slots_offset + max_requests * slot_size;
+        // 对齐到 8 字节
+        let mutex_offset = (mutex_offset + 7) / 8 * 8;
 
         Self {
             magic: consts::SHM_MAGIC,
@@ -75,11 +66,10 @@ impl ShmControlHeader {
             response_slots_offset,
             mutex_offset,
             slot_size,
-            _reserved: [0u8; 4048],
         }
     }
 
-    /// 验证控制头。
+    /// 验证控制头魔数。
     pub fn validate(&self) -> MinosResult<()> {
         if self.magic != consts::SHM_MAGIC {
             return Err(MinosError::ShmError("bad shm magic".into()));
@@ -95,32 +85,21 @@ impl ShmControlHeader {
 }
 
 /// 共享内存区域。
-///
-/// 管理整个共享内存区域的生命周期：
-/// - `create`：服务端创建新的共享内存区域
-/// - `open`：客户端打开已存在的共享内存区域
-/// - `destroy`：服务端销毁共享内存区域
 pub struct ShmRegion {
-    /// mmap 映射的基地址
+    /// mmap 基地址
     ptr: *mut u8,
     /// 区域总大小（字节）
     size: usize,
-    /// shm_open 返回的文件描述符
+    /// shm_open 文件描述符
     shm_fd: i32,
     /// 共享内存名称
     name: String,
 }
 
-// 共享内存指针可跨线程传递
 unsafe impl Send for ShmRegion {}
 
 impl ShmRegion {
     /// 创建新的共享内存区域（服务端调用）。
-    ///
-    /// `name`：共享内存名称，如 "minos_shm"
-    /// `num_data_pages`：数据页数量
-    /// `max_requests`：最大并发请求数
-    /// `slot_size`：每个请求/响应槽位大小（字节）
     pub fn create(
         name: &str,
         num_data_pages: u32,
@@ -128,26 +107,30 @@ impl ShmRegion {
         slot_size: u32,
     ) -> MinosResult<Self> {
         let page_size = consts::SHM_PAGE_SIZE as usize;
-        let total_pages = num_data_pages + 1; // +1 for control page (page 0)
 
-        // 位图大小 = ceil(total_pages / 8)
-        let bitmap_size = (total_pages as usize + 7) / 8;
-        // 对齐到 8 字节
-        let bitmap_size = ((bitmap_size + 7) / 8) * 8;
+        // 控制页内容：header + bitmap + slots + mutex
+        let header_size = std::mem::size_of::<ShmControlHeader>();
+        let bitmap_size = ((num_data_pages as usize + 7) / 8 + 7) / 8 * 8; // 8 字节对齐
+        let control_page_used = {
+            let mutex_unaligned = header_size + bitmap_size + 2 * max_requests as usize * slot_size as usize;
+            (mutex_unaligned + 7) / 8 * 8 + std::mem::size_of::<libc::pthread_mutex_t>()
+        };
+        assert!(
+            control_page_used <= page_size,
+            "control page overflow: {control_page_used} > {page_size}"
+        );
 
-        let region_size = total_pages as usize * page_size;
+        // 总页数 = 1 控制页 + N 数据页
+        let total_pages = 1 + num_data_pages as usize;
+        let region_size = total_pages * page_size;
 
         let cname = CString::new(name).map_err(|e| {
             MinosError::ShmError(format!("invalid shm name: {e}"))
         })?;
 
-        // 先清理可能残留的同名共享内存
         unsafe { libc::shm_unlink(cname.as_ptr()) };
 
-        // 创建共享内存对象
-        let shm_fd = unsafe {
-            libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600)
-        };
+        let shm_fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
         if shm_fd < 0 {
             return Err(MinosError::ShmError(format!(
                 "shm_open failed: {}",
@@ -155,18 +138,18 @@ impl ShmRegion {
             )));
         }
 
-        // 设置大小
         let ret = unsafe { libc::ftruncate(shm_fd, region_size as libc::off_t) };
         if ret != 0 {
-            unsafe { libc::close(shm_fd) };
-            unsafe { libc::shm_unlink(cname.as_ptr()) };
+            unsafe {
+                libc::close(shm_fd);
+                libc::shm_unlink(cname.as_ptr());
+            };
             return Err(MinosError::ShmError(format!(
                 "ftruncate failed: {}",
                 io::Error::last_os_error()
             )));
         }
 
-        // mmap
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -178,16 +161,18 @@ impl ShmRegion {
             )
         };
         if ptr == libc::MAP_FAILED {
-            unsafe { libc::close(shm_fd) };
-            unsafe { libc::shm_unlink(cname.as_ptr()) };
+            unsafe {
+                libc::close(shm_fd);
+                libc::shm_unlink(cname.as_ptr());
+            };
             return Err(MinosError::ShmError(format!(
                 "mmap failed: {}",
                 io::Error::last_os_error()
             )));
         }
 
-        // 初始化控制头
-        let bitmap_offset = std::mem::size_of::<ShmControlHeader>() as u32;
+        // 写入控制头
+        let bitmap_offset = header_size as u32;
         let header = ShmControlHeader::new(
             num_data_pages,
             bitmap_offset,
@@ -222,7 +207,6 @@ impl ShmRegion {
             )));
         }
 
-        // 获取区域大小
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         let ret = unsafe { libc::fstat(shm_fd, &mut stat) };
         if ret != 0 {
@@ -259,95 +243,64 @@ impl ShmRegion {
             name: name.to_string(),
         };
 
-        // 验证控制头
         region.header().validate()?;
-
         Ok(region)
     }
 
-    /// 销毁共享内存区域（服务端调用）。
-    ///
-    /// 解除映射、关闭文件描述符、删除共享内存名称。
-    /// 调用后 Drop 不会再重复释放资源。
+    /// 销毁共享内存区域（服务端调用），防止 Drop 重复释放。
     pub fn destroy(mut self) -> MinosResult<()> {
-        // 保存值用于手动清理
         let ptr = self.ptr;
         let size = self.size;
         let shm_fd = self.shm_fd;
         let name = std::mem::take(&mut self.name);
 
-        // 标记为已销毁，防止 Drop 重复释放
         self.ptr = std::ptr::null_mut();
         self.shm_fd = -1;
-
-        // 手动 drop self 以触发 Drop（此时 ptr=null, fd=-1，Drop 无操作）
         drop(self);
 
-        // 现在安全地清理实际资源
-        let ret = unsafe { libc::munmap(ptr as *mut libc::c_void, size) };
-        if ret != 0 {
-            log::warn!("munmap failed: {}", io::Error::last_os_error());
-        }
-
-        let ret = unsafe { libc::close(shm_fd) };
-        if ret != 0 {
-            log::warn!("close shm_fd failed: {}", io::Error::last_os_error());
-        }
+        unsafe { libc::munmap(ptr as *mut libc::c_void, size) };
+        unsafe { libc::close(shm_fd) };
 
         let cname = CString::new(name.as_str()).unwrap();
-        let ret = unsafe { libc::shm_unlink(cname.as_ptr()) };
-        if ret != 0 {
-            log::warn!(
-                "shm_unlink '{}' failed: {}",
-                name,
-                io::Error::last_os_error()
-            );
-        }
+        unsafe { libc::shm_unlink(cname.as_ptr()) };
 
         Ok(())
     }
 
-    /// 获取控制头的不可变引用。
+    /// 获取控制头引用。
     pub fn header(&self) -> &ShmControlHeader {
         unsafe { &*(self.ptr as *const ShmControlHeader) }
     }
 
-    /// 获取控制头的可变引用。
-    pub fn header_mut(&mut self) -> &mut ShmControlHeader {
-        unsafe { &mut *(self.ptr as *mut ShmControlHeader) }
-    }
-
-    /// 获取数据页区域的起始指针。
+    /// 获取数据页区域起始指针（Page 1 起点）。
     pub fn data_area(&self) -> *mut u8 {
         unsafe { self.ptr.add(consts::SHM_PAGE_SIZE as usize) }
     }
 
-    /// 获取指定数据页的指针。
-    ///
-    /// page 0 是第一个数据页（不包含控制页）。
+    /// 获取指定数据页指针（page_idx 从 0 开始）。
     pub fn page_ptr(&self, page_idx: u32) -> *mut u8 {
         let offset = (page_idx as usize + 1) * consts::SHM_PAGE_SIZE as usize;
         unsafe { self.ptr.add(offset) }
     }
 
-    /// 获取页分配位图的起始指针。
+    /// 获取页分配位图指针（位于控制页内）。
     pub fn bitmap_ptr(&self) -> *mut u8 {
         let offset = self.header().page_bitmap_offset as usize;
         unsafe { self.ptr.add(offset) }
     }
 
-    /// 获取互斥锁的指针。
+    /// 获取互斥锁指针（位于控制页内）。
     pub fn mutex_ptr(&self) -> *mut u8 {
         let offset = self.header().mutex_offset as usize;
         unsafe { self.ptr.add(offset) }
     }
 
-    /// 区域总大小（字节）。
+    /// 区域总大小。
     pub fn size(&self) -> usize {
         self.size
     }
 
-    /// 将数据拷贝到从 start_page 开始的连续页面中。
+    /// 写数据到连续页面。
     pub fn write_to_pages(&self, start_page: u32, data: &[u8]) {
         let page_size = consts::SHM_PAGE_SIZE as usize;
         for (i, chunk) in data.chunks(page_size).enumerate() {
@@ -358,12 +311,11 @@ impl ShmRegion {
         }
     }
 
-    /// 从 start_page 开始的连续页面中读取数据。
+    /// 从连续页面读取数据。
     pub fn read_from_pages(&self, start_page: u32, size: u64) -> Vec<u8> {
         let mut data = vec![0u8; size as usize];
         let page_size = consts::SHM_PAGE_SIZE as usize;
         let mut offset = 0;
-
         let num_pages = (size as usize + page_size - 1) / page_size;
         for i in 0..num_pages {
             let src = self.page_ptr(start_page + i as u32);
@@ -380,16 +332,20 @@ impl ShmRegion {
 
 impl Drop for ShmRegion {
     fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, self.size);
-            libc::close(self.shm_fd);
+        if !self.ptr.is_null() {
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.size);
+            }
+        }
+        if self.shm_fd >= 0 {
+            unsafe {
+                libc::close(self.shm_fd);
+            }
         }
     }
 }
 
 // ─── 单元测试 ───
-//
-// 注意：shm_open 在 macOS 上有不同的行为，这些测试仅在 Linux 上运行。
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -402,7 +358,7 @@ mod tests {
     #[test]
     fn test_create_and_destroy() {
         let name = test_name("create");
-        let _ = std::fs::remove_file(&name); // cleanup leftover on macOS
+        let _ = std::fs::remove_file(&name);
         let region = ShmRegion::create(&name, 16, 8, 256).unwrap();
         let header = region.header();
         assert_eq!(header.magic, consts::SHM_MAGIC);

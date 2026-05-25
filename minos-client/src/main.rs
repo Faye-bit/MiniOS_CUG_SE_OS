@@ -241,8 +241,14 @@ fn cmd_get(cli: &Cli, id: &str, output: &Option<PathBuf>) {
     }
 
     let start_page: u32 = parts[2].parse().unwrap_or(0);
+    let num_pages: u32 = parts[3].parse().unwrap_or(0);
+
     let region = open_shm(&cli.shm_name);
     let data = region.read_from_pages(start_page, size);
+
+    // 读取完毕后释放共享内存页
+    let page_alloc = make_page_alloc(&region);
+    page_alloc.free_pages(start_page, num_pages);
     drop(region);
 
     if let Some(out_path) = output {
