@@ -47,6 +47,8 @@ enum Command {
     },
     List,
     Status,
+    /// 停止服务端
+    Stop,
 }
 
 fn main() {
@@ -57,7 +59,13 @@ fn main() {
         Command::Put { file, name, content_type, tags } => cmd_put(&cli, file, name, content_type, tags),
         Command::Get { id, output } => cmd_get(&cli, id, output),
         Command::Delete { uuid } => cmd_delete(&cli, uuid),
+        Command::Stop => cmd_stop(&cli),
     }
+}
+
+fn cmd_stop(cli: &Cli) {
+    let resp = socket_cmd(&cli.socket, "STOP\n");
+    print!("{resp}");
 }
 
 // ─── 基础设施 ───

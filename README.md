@@ -45,6 +45,15 @@ cargo build --release
     --total-blocks 4096
 ```
 
+### 后台模式（集成测试用）
+
+```bash
+# 重定向输出，避免干扰终端
+./target/release/minos-server --store-path /tmp/test_store.odb > /tmp/minos.log 2>&1 &
+SERVER_PID=$!
+sleep 1
+```
+
 ### 守护进程模式
 
 ```bash
@@ -57,10 +66,13 @@ cargo build --release
 ### 停止服务
 
 ```bash
-# 通过客户端
-./target/release/minos-client --socket /tmp/minos.sock status
+# 方式1：客户端 stop 命令（推荐，同步返回结果）
+./target/release/minos-client stop
 
-# 或发送 SIGTERM
+# 方式2：发送 SIGTERM 后等待进程退出
+kill $SERVER_PID && wait $SERVER_PID
+
+# 方式3：通过 PID 文件
 kill $(cat /tmp/minos.pid)
 ```
 
@@ -179,34 +191,36 @@ cargo test -p minos-lib --lib storage::engine::tests::test_put_large_object_span
 ### 集成测试（手动）
 
 ```bash
-# 1. 启动服务端（前台模式）
-./target/release/minos-server --store-path /tmp/test_store.odb &
+# 0. 清理残留
+rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minos.sock
+
+# 1. 启动服务端（后台 + 重定向日志）
+./target/release/minos-server --store-path /tmp/test_store.odb > /tmp/minos.log 2>&1 &
 SERVER_PID=$!
 sleep 1
 
 # 2. 基本操作流程
 echo "Hello, MiniOS!" > /tmp/test_file.txt
-
 ./target/release/minos-client put /tmp/test_file.txt --name hello
 ./target/release/minos-client list
 ./target/release/minos-client get hello
 ./target/release/minos-client status
 
-# 3. 大对象测试（10MB）
+# 3. 大对象测试（10MB，自动分块传输）
 dd if=/dev/urandom of=/tmp/large.bin bs=1M count=10 2>/dev/null
 ./target/release/minos-client put /tmp/large.bin --name large-test
 
 # 4. 重启持久化测试
-kill $SERVER_PID
-sleep 1
-./target/release/minos-server --store-path /tmp/test_store.odb &
+kill $SERVER_PID && wait $SERVER_PID
+./target/release/minos-server --store-path /tmp/test_store.odb > /tmp/minos.log 2>&1 &
+SERVER_PID=$!
 sleep 1
 ./target/release/minos-client list   # 应显示之前的对象
 ./target/release/minos-client get hello
 
 # 5. 清理
-kill $(pgrep minos-server)
-rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin
+./target/release/minos-client stop 2>/dev/null || kill $SERVER_PID 2>/dev/null
+rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minos.log /tmp/minos.sock
 ```
 
 ### 并发测试
