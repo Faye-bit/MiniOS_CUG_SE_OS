@@ -107,8 +107,7 @@ fn main() {
         let cname = CString::new(args.shm_name.as_str()).unwrap();
         unsafe { libc::shm_unlink(cname.as_ptr()) };
     }
-    let slot_size = 256u32;
-    let region = ShmRegion::create(&args.shm_name, args.shm_pages, args.max_clients, slot_size)
+    let region = ShmRegion::create(&args.shm_name, args.shm_pages)
         .unwrap_or_else(|e| {
             log::error!("Cannot create shared memory: {e}");
             std::process::exit(1);
