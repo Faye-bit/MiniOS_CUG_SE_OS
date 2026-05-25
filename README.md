@@ -185,7 +185,7 @@ SERVER_PID=$!
 sleep 1
 
 # 2. 基本操作流程
-echo "Hello, MinOS!" > /tmp/test_file.txt
+echo "Hello, MiniOS!" > /tmp/test_file.txt
 
 ./target/release/minos-client put /tmp/test_file.txt --name hello
 ./target/release/minos-client list

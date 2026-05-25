@@ -141,30 +141,19 @@ impl ShmRegion {
             MinosError::ShmError(format!("invalid shm name: {e}"))
         })?;
 
-        // shm_open
+        // 先清理可能残留的同名共享内存
+        unsafe { libc::shm_unlink(cname.as_ptr()) };
+
+        // 创建共享内存对象
         let shm_fd = unsafe {
-            libc::shm_open(
-                cname.as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
-                0o600,
-            )
+            libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600)
         };
         if shm_fd < 0 {
-            // 如果已存在，先 unlink 再创建
-            unsafe { libc::shm_unlink(cname.as_ptr()) };
-            let fd = unsafe {
-                libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR | libc::O_EXCL, 0o600)
-            };
-            if fd < 0 {
-                return Err(MinosError::ShmError(format!(
-                    "shm_open failed: {}",
-                    io::Error::last_os_error()
-                )));
-            }
-            fd
-        } else {
-            shm_fd
-        };
+            return Err(MinosError::ShmError(format!(
+                "shm_open failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
 
         // 设置大小
         let ret = unsafe { libc::ftruncate(shm_fd, region_size as libc::off_t) };

@@ -3,7 +3,7 @@
 //! 支持以下命令：
 //! - put <file>       上传本地文件到对象存储
 //! - get <id>         下载对象到标准输出或文件
-//! - delete <id>      删除对象（通过 UUID）
+//! - delete <uuid>    删除对象
 //! - list             列出所有对象
 //! - status           查看服务端状态
 
@@ -44,7 +44,7 @@ enum Command {
         #[arg(long, default_value = "application/octet-stream")]
         content_type: String,
         /// 自定义标签（JSON 字符串）
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "{}")]
         tags: String,
     },
     /// 下载对象
@@ -80,26 +80,15 @@ fn main() {
     }
 }
 
-/// 建立到服务端的 Unix Socket 连接。
-fn connect_socket(socket_path: &str) -> UnixStream {
-    UnixStream::connect(socket_path).unwrap_or_else(|e| {
+// ─── Socket 通信 ───
+
+/// 通过 socket 发送命令并读取一行响应。
+fn socket_command(socket_path: &str, command: &str) -> String {
+    let mut stream = UnixStream::connect(socket_path).unwrap_or_else(|e| {
         eprintln!("ERROR: cannot connect to server at '{socket_path}': {e}");
         eprintln!("Is the minos-server running?");
         std::process::exit(1);
-    })
-}
-
-/// 打开共享内存区域。
-fn open_shm(name: &str) -> ShmRegion {
-    ShmRegion::open(name).unwrap_or_else(|e| {
-        eprintln!("ERROR: cannot open shared memory '{name}': {e}");
-        std::process::exit(1);
-    })
-}
-
-/// 通过 socket 发送文本命令并读取响应。
-fn socket_command(socket_path: &str, command: &str) -> String {
-    let mut stream = connect_socket(socket_path);
+    });
     stream.write_all(command.as_bytes()).unwrap();
     stream.flush().unwrap();
     let mut response = String::new();
@@ -107,16 +96,25 @@ fn socket_command(socket_path: &str, command: &str) -> String {
     response
 }
 
+/// 打开共享内存区域。
+fn open_shm(name: &str) -> ShmRegion {
+    ShmRegion::open(name).unwrap_or_else(|e| {
+        eprintln!("ERROR: cannot open shared memory '{name}': {e}");
+        eprintln!("Is the minos-server running?");
+        std::process::exit(1);
+    })
+}
+
 // ─── 命令实现 ───
 
 fn cmd_status(cli: &Cli) {
     let resp = socket_command(&cli.socket, "STATUS\n");
-    println!("{resp}");
+    print!("{resp}");
 }
 
 fn cmd_list(cli: &Cli) {
     let resp = socket_command(&cli.socket, "LIST\n");
-    println!("{resp}");
+    print!("{resp}");
 }
 
 fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str, tags: &str) {
@@ -124,7 +122,6 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
         .clone()
         .unwrap_or_else(|| file.file_name().unwrap().to_string_lossy().to_string());
 
-    // 读取文件
     let data = match std::fs::read(file) {
         Ok(d) => d,
         Err(e) => {
@@ -138,7 +135,7 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
         std::process::exit(1);
     }
 
-    // 打开共享内存
+    // 打开共享内存并分配页
     let region = open_shm(&cli.shm_name);
     let total_pages = region.header().total_pages;
     let free_pages_offset = 16usize;
@@ -149,7 +146,6 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
     };
     let page_alloc = unsafe { PageAllocator::new(region.bitmap_ptr(), total_pages, free_pages_ptr) };
 
-    // 计算需要的页数
     let pages_needed = ((data.len() as u64 + 4095) / 4096) as u32;
     let start_page = page_alloc.alloc_pages(pages_needed).unwrap_or_else(|| {
         eprintln!("ERROR: not enough shared memory pages (need {pages_needed})");
@@ -159,27 +155,67 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
     // 写入数据到共享内存
     region.write_to_pages(start_page, &data);
 
-    // 通过 socket 发送 Put 命令
-    let put_cmd = format!(
-        "PUT {name} {size} {content_type} {tags} {start_page} {pages_needed}\n",
-        name = obj_name,
-        size = data.len(),
+    // 通过 socket 发送 PUT 命令
+    let size = data.len();
+    let tags_escaped = tags.replace(' ', "_"); // 空格会影响协议解析
+    let cmd = format!(
+        "PUT {obj_name} {size} {content_type} {tags_escaped} {start_page} {pages_needed}\n"
     );
-    let resp = socket_command(&cli.socket, &put_cmd);
-    println!("{resp}");
+    let resp = socket_command(&cli.socket, &cmd);
+    print!("{resp}");
 
-    // 释放共享内存页
+    // 释放共享内存页（服务端已读取数据）
     page_alloc.free_pages(start_page, pages_needed);
     drop(region);
 }
 
-fn cmd_get(cli: &Cli, id: &str, _output: &Option<PathBuf>) {
-    // 先尝试通过 socket 查询对象元数据
-    let resp = socket_command(&cli.socket, &format!("GET {id}\n"));
-    println!("{resp}");
+fn cmd_get(cli: &Cli, id: &str, output: &Option<PathBuf>) {
+    // 发送 GET 命令
+    let cmd = format!("GET {id}\n");
+    let resp = socket_command(&cli.socket, &cmd);
+
+    // 解析响应
+    let resp = resp.trim();
+    if resp.starts_with("ERROR") {
+        eprintln!("{resp}");
+        std::process::exit(1);
+    }
+
+    // 格式: OK <size> <start_page> <num_pages>
+    let parts: Vec<&str> = resp.split_whitespace().collect();
+    if parts.len() < 4 || parts[0] != "OK" {
+        eprintln!("ERROR: unexpected response: {resp}");
+        std::process::exit(1);
+    }
+
+    let size: u64 = parts[1].parse().unwrap_or(0);
+    if size == 0 {
+        eprintln!("OK (empty object)");
+        return;
+    }
+
+    let start_page: u32 = parts[2].parse().unwrap_or(0);
+    let _num_pages: u32 = parts[3].parse().unwrap_or(0);
+
+    // 从共享内存读取数据
+    let region = open_shm(&cli.shm_name);
+    let data = region.read_from_pages(start_page, size);
+    drop(region);
+
+    // 输出
+    if let Some(out_path) = output {
+        std::fs::write(out_path, &data).unwrap_or_else(|e| {
+            eprintln!("ERROR writing output file: {e}");
+            std::process::exit(1);
+        });
+        eprintln!("OK: {} bytes written to {}", data.len(), out_path.display());
+    } else {
+        std::io::stdout().write_all(&data).unwrap();
+    }
 }
 
 fn cmd_delete(cli: &Cli, uuid: &str) {
-    let resp = socket_command(&cli.socket, &format!("DELETE {uuid}\n"));
-    println!("{resp}");
+    let cmd = format!("DELETE {uuid}\n");
+    let resp = socket_command(&cli.socket, &cmd);
+    print!("{resp}");
 }
