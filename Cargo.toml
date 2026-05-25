@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "minos-lib",
+    "minos-server",
+    "minos-client",
+]
