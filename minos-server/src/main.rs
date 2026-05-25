@@ -1,11 +1,4 @@
 //! MinOS 对象存储服务端 — 守护进程入口。
-//!
-//! 负责：
-//! 1. 解析命令行参数
-//! 2. 创建/打开 store.odb 存储引擎
-//! 3. 初始化共享内存区域和同步原语
-//! 4. 监听 Unix Domain Socket，处理客户端请求
-//! 5. 优雅关闭
 
 use clap::Parser;
 use minos_lib::cache::lru::LruCache;
@@ -14,70 +7,56 @@ use minos_lib::daemon;
 use minos_lib::shm::page::PageAllocator;
 use minos_lib::shm::region::ShmRegion;
 use minos_lib::storage::engine::ObjectStore;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// MinOS 对象存储服务端。
 #[derive(Parser, Debug)]
 #[command(name = "minos-server", version, about = "MinOS object storage daemon")]
 struct Args {
-    /// 存储文件路径
     #[arg(long, default_value = consts::DEFAULT_STORE_PATH)]
     store_path: String,
-
-    /// Unix Domain Socket 路径
     #[arg(long, default_value = consts::DEFAULT_SOCKET_PATH)]
     socket_path: String,
-
-    /// 共享内存名称
     #[arg(long, default_value = consts::DEFAULT_SHM_NAME)]
     shm_name: String,
-
-    /// 共享内存数据页数
     #[arg(long, default_value_t = consts::DEFAULT_SHM_PAGES)]
     shm_pages: u32,
-
-    /// LRU 缓存容量（条目数）
     #[arg(long, default_value_t = consts::DEFAULT_CACHE_CAPACITY)]
     cache_capacity: usize,
-
-    /// LRU 缓存最大内存（MB）
     #[arg(long, default_value_t = 64)]
     cache_memory_mb: u64,
-
-    /// 最大对象数
     #[arg(long, default_value_t = consts::DEFAULT_MAX_OBJECTS)]
     max_objects: u64,
-
-    /// 数据块总数
     #[arg(long, default_value_t = consts::DEFAULT_TOTAL_BLOCKS)]
     total_blocks: u64,
-
-    /// 最大并发请求数
     #[arg(long, default_value_t = consts::DEFAULT_MAX_CLIENTS as u32)]
     max_clients: u32,
-
-    /// 以守护进程方式运行
     #[arg(long, default_value_t = false)]
     daemon: bool,
-
-    /// PID 文件路径
     #[arg(long, default_value = "/tmp/minos.pid")]
     pidfile: String,
 }
 
-/// 共享的服务端状态，各工作线程共享。
+/// 待完成的分块上传。
+struct PendingUpload {
+    data: Vec<u8>,
+    content_type: String,
+    tags: String,
+}
+
 struct ServerState {
     store: ObjectStore,
     cache: LruCache,
     region: ShmRegion,
     page_alloc: PageAllocator,
+    /// 按名称索引的分块上传缓冲区
+    pending_uploads: HashMap<String, PendingUpload>,
 }
 
-/// 线程安全引用包装。
 type SharedState = Arc<Mutex<ServerState>>;
 
 fn main() {
@@ -93,7 +72,6 @@ fn main() {
 
     log::info!("MinOS server starting...");
 
-    // 打开或创建存储文件
     let store = if Path::new(&args.store_path).exists() {
         log::info!("Opening existing store: {}", args.store_path);
         ObjectStore::open(&args.store_path).unwrap_or_else(|e| {
@@ -112,7 +90,6 @@ fn main() {
             })
     };
 
-    // 初始化 LRU 缓存
     let cache_memory = args.cache_memory_mb * 1024 * 1024;
     let cache = LruCache::new(args.cache_capacity, cache_memory);
     {
@@ -124,7 +101,7 @@ fn main() {
         );
     }
 
-    // 创建共享内存区域（先 unlink 清理残留）
+    // 创建共享内存区域
     {
         use std::ffi::CString;
         let cname = CString::new(args.shm_name.as_str()).unwrap();
@@ -141,7 +118,6 @@ fn main() {
         args.shm_name, args.shm_pages
     );
 
-    // 初始化页分配器
     let total_pages = region.header().total_pages;
     let free_pages_offset = 16usize;
     let free_pages_ptr = unsafe {
@@ -167,9 +143,9 @@ fn main() {
         cache,
         region,
         page_alloc,
+        pending_uploads: HashMap::new(),
     }));
 
-    // 清理旧的 socket
     let _ = std::fs::remove_file(&args.socket_path);
     let listener = UnixListener::bind(&args.socket_path).unwrap_or_else(|e| {
         log::error!("Cannot bind to {}: {}", args.socket_path, e);
@@ -179,14 +155,12 @@ fn main() {
 
     listener.set_nonblocking(true).expect("set nonblocking");
 
-    // 主事件循环（纯轮询，无阻塞调用）
     loop {
         if daemon::is_shutdown_requested() {
             log::info!("Shutdown signal received, exiting...");
             break;
         }
 
-        // 接收新连接
         match listener.accept() {
             Ok((stream, addr)) => {
                 log::debug!("New connection: {:?}", addr);
@@ -205,7 +179,6 @@ fn main() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // 优雅关闭
     log::info!("Shutting down...");
     if let Ok(state) = Arc::try_unwrap(state) {
         let mut state = state.into_inner().unwrap();
@@ -219,15 +192,6 @@ fn main() {
 
 // ─── Socket 客户端处理 ───
 
-/// 处理 Unix Socket 客户端连接。
-///
-/// 协议（空格分隔的文本行）：
-/// - PUT <name> <size> <content_type> <tags> <start_page> <num_pages>
-/// - GET <uuid_or_name>
-/// - DELETE <uuid>
-/// - LIST
-/// - STATUS
-/// - STOP
 fn handle_client(mut stream: UnixStream, state: SharedState) {
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf) {
@@ -248,17 +212,19 @@ fn dispatch_command(msg: &str, state: &SharedState) -> String {
     }
 
     match parts[0].to_uppercase().as_str() {
-        "PUT" => cmd_put_socket(&parts, state),
-        "GET" => cmd_get_socket(&parts, state),
-        "DELETE" => cmd_delete_socket(&parts, state),
-        "LIST" => cmd_list_socket(state),
-        "STATUS" => cmd_status_socket(state),
+        "PUT" => cmd_put(&parts, state),
+        "PUT_BEGIN" => cmd_put_begin(&parts, state),
+        "PUT_CHUNK" => cmd_put_chunk(&parts, state),
+        "PUT_END" => cmd_put_end(&parts, state),
+        "GET" => cmd_get(&parts, state),
+        "DELETE" => cmd_delete(&parts, state),
+        "LIST" => cmd_list(state),
+        "STATUS" => cmd_status(state),
         "STOP" => {
-            use std::sync::atomic::AtomicBool;
-            // 通过 daemon 模块的原子标志设置关闭信号
+            use std::sync::atomic::{AtomicBool, Ordering};
             unsafe {
                 let ptr = &daemon::is_shutdown_requested as *const _ as *mut AtomicBool;
-                (*ptr).store(true, std::sync::atomic::Ordering::SeqCst);
+                (*ptr).store(true, Ordering::SeqCst);
             }
             "OK shutting down\n".into()
         }
@@ -266,9 +232,108 @@ fn dispatch_command(msg: &str, state: &SharedState) -> String {
     }
 }
 
-/// PUT: 从共享内存读取数据，写入 store.odb。
+// ─── 分块上传协议 ───
+
+/// PUT_BEGIN <name> <total_size> <content_type> <tags>
+/// 服务端为指定名称创建上传缓冲区。
+fn cmd_put_begin(parts: &[&str], state: &SharedState) -> String {
+    if parts.len() < 5 {
+        return "ERROR PUT_BEGIN requires: name total_size content_type tags\n".into();
+    }
+    let name = parts[1].to_string();
+    let total_size: usize = match parts[2].parse() {
+        Ok(v) => v,
+        Err(_) => return "ERROR invalid total_size\n".into(),
+    };
+    let content_type = parts[3].to_string();
+    let tags = parts[4].to_string();
+
+    let mut server_state = state.lock().unwrap();
+    server_state.pending_uploads.insert(
+        name.clone(),
+        PendingUpload {
+            data: Vec::with_capacity(total_size),
+            content_type,
+            tags,
+        },
+    );
+    log::info!("PUT_BEGIN: name={name}, total_size={total_size}");
+    "OK\n".into()
+}
+
+/// PUT_CHUNK <name> <chunk_size> <start_page> <num_pages>
+/// 从共享内存读取一块数据，追加到上传缓冲区。
+fn cmd_put_chunk(parts: &[&str], state: &SharedState) -> String {
+    if parts.len() < 5 {
+        return "ERROR PUT_CHUNK requires: name chunk_size start_page num_pages\n".into();
+    }
+    let name = parts[1].to_string();
+    let chunk_size: u64 = match parts[2].parse() {
+        Ok(v) => v,
+        Err(_) => return "ERROR invalid chunk_size\n".into(),
+    };
+    let start_page: u32 = match parts[3].parse() {
+        Ok(v) => v,
+        Err(_) => return "ERROR invalid start_page\n".into(),
+    };
+    let num_pages: u32 = match parts[4].parse() {
+        Ok(v) => v,
+        Err(_) => return "ERROR invalid num_pages\n".into(),
+    };
+
+    let mut server_state = state.lock().unwrap();
+
+    if !server_state.pending_uploads.contains_key(&name) {
+        return "ERROR no pending upload for this name, send PUT_BEGIN first\n".into();
+    }
+
+    // 从共享内存读取块数据（释放 borrow 后才访问 upload）
+    let chunk = server_state.region.read_from_pages(start_page, chunk_size);
+    // 释放页
+    server_state.page_alloc.free_pages(start_page, num_pages);
+
+    // 追加到上传缓冲区
+    let upload = server_state.pending_uploads.get_mut(&name).unwrap();
+    upload.data.extend_from_slice(&chunk);
+
+    log::info!(
+        "PUT_CHUNK: name={name}, chunk_size={}, total_accumulated={}",
+        chunk_size,
+        upload.data.len()
+    );
+    "OK\n".into()
+}
+
+/// PUT_END <name>
+/// 将累积的数据写入 store.odb，清理上传缓冲区。
+fn cmd_put_end(parts: &[&str], state: &SharedState) -> String {
+    if parts.len() < 2 {
+        return "ERROR PUT_END requires: name\n".into();
+    }
+    let name = parts[1].to_string();
+
+    let mut server_state = state.lock().unwrap();
+    let upload = match server_state.pending_uploads.remove(&name) {
+        Some(u) => u,
+        None => return "ERROR no pending upload for this name\n".into(),
+    };
+
+    let size = upload.data.len() as u64;
+    match server_state.store.put(&name, &upload.data, &upload.content_type, &upload.tags) {
+        Ok(uuid) => {
+            server_state
+                .cache
+                .put(uuid, upload.data, name.clone(), size);
+            log::info!("PUT_END: name={name}, uuid={:?}, size={size}", uuid_fmt(&uuid));
+            format!("OK {}\n", uuid_fmt(&uuid))
+        }
+        Err(e) => format!("ERROR {e}\n"),
+    }
+}
+
+/// 标准 PUT（小文件单次传输，保留兼容）。
 /// 格式: PUT <name> <size> <content_type> <tags> <start_page> <num_pages>
-fn cmd_put_socket(parts: &[&str], state: &SharedState) -> String {
+fn cmd_put(parts: &[&str], state: &SharedState) -> String {
     if parts.len() < 7 {
         return "ERROR PUT requires: name size content_type tags start_page num_pages\n".into();
     }
@@ -289,16 +354,11 @@ fn cmd_put_socket(parts: &[&str], state: &SharedState) -> String {
     };
 
     let mut server_state = state.lock().unwrap();
-
-    // 从共享内存读取数据
     let data = server_state.region.read_from_pages(start_page, size);
 
-    // 写入存储引擎
     match server_state.store.put(name, &data, content_type, tags) {
         Ok(uuid) => {
-            // 释放共享内存页
             server_state.page_alloc.free_pages(start_page, num_pages);
-            // 更新缓存
             server_state.cache.put(uuid, data, name.into(), size);
             format!("OK {}\n", uuid_fmt(&uuid))
         }
@@ -309,36 +369,31 @@ fn cmd_put_socket(parts: &[&str], state: &SharedState) -> String {
     }
 }
 
-/// GET: 从 store.odb 读取数据，写入共享内存返回。
-/// 格式: GET <uuid_or_name>
-fn cmd_get_socket(parts: &[&str], state: &SharedState) -> String {
+// ─── GET / DELETE / LIST / STATUS ───
+
+fn cmd_get(parts: &[&str], state: &SharedState) -> String {
     if parts.len() < 2 {
         return "ERROR GET requires uuid or name\n".into();
     }
     let id = parts[1];
     let mut server_state = state.lock().unwrap();
 
-    // 尝试解析为 UUID
-    let result = if let Some(uuid) = parse_uuid(id) {
-        // 先查缓存，再查存储
-        let cached = server_state.cache.get(&uuid).map(|d| d.to_vec());
-        if let Some(data) = cached {
-            write_get_result(&mut server_state, data)
-        } else {
-            match server_state.store.get_by_id(&uuid) {
-                Ok(Some(obj)) => {
-                    let sz = obj.summary.size;
-                    server_state
-                        .cache
-                        .put(obj.summary.uuid, obj.data.clone(), obj.summary.name, sz);
-                    write_get_result(&mut server_state, obj.data)
-                }
-                Ok(None) => "ERROR object not found\n".into(),
-                Err(e) => format!("ERROR {e}\n"),
+    if let Some(uuid) = parse_uuid(id) {
+        if let Some(data) = server_state.cache.get(&uuid).map(|d| d.to_vec()) {
+            return write_get_result(&mut server_state, data);
+        }
+        match server_state.store.get_by_id(&uuid) {
+            Ok(Some(obj)) => {
+                let sz = obj.summary.size;
+                server_state
+                    .cache
+                    .put(obj.summary.uuid, obj.data.clone(), obj.summary.name, sz);
+                write_get_result(&mut server_state, obj.data)
             }
+            Ok(None) => "ERROR object not found\n".into(),
+            Err(e) => format!("ERROR {e}\n"),
         }
     } else {
-        // 按名称查找
         match server_state.store.get_by_name(id) {
             Ok(Some(obj)) => {
                 let sz = obj.summary.size;
@@ -350,13 +405,10 @@ fn cmd_get_socket(parts: &[&str], state: &SharedState) -> String {
             Ok(None) => "ERROR object not found\n".into(),
             Err(e) => format!("ERROR {e}\n"),
         }
-    };
-    result
+    }
 }
 
-/// DELETE: 删除对象。
-/// 格式: DELETE <uuid>
-fn cmd_delete_socket(parts: &[&str], state: &SharedState) -> String {
+fn cmd_delete(parts: &[&str], state: &SharedState) -> String {
     if parts.len() < 2 {
         return "ERROR DELETE requires uuid\n".into();
     }
@@ -364,7 +416,6 @@ fn cmd_delete_socket(parts: &[&str], state: &SharedState) -> String {
         Some(u) => u,
         None => return "ERROR invalid uuid format\n".into(),
     };
-
     let mut server_state = state.lock().unwrap();
     match server_state.store.delete(&uuid) {
         Ok(true) => {
@@ -376,8 +427,7 @@ fn cmd_delete_socket(parts: &[&str], state: &SharedState) -> String {
     }
 }
 
-/// LIST: 列出所有对象。
-fn cmd_list_socket(state: &SharedState) -> String {
+fn cmd_list(state: &SharedState) -> String {
     let server_state = state.lock().unwrap();
     let objects = server_state.store.list();
     let mut resp = format!("OK {}\n", objects.len());
@@ -394,8 +444,7 @@ fn cmd_list_socket(state: &SharedState) -> String {
     resp
 }
 
-/// STATUS: 查询服务状态。
-fn cmd_status_socket(state: &SharedState) -> String {
+fn cmd_status(state: &SharedState) -> String {
     let server_state = state.lock().unwrap();
     let stats = server_state.store.stats();
     let cache_stats = server_state.cache.stats();
@@ -417,7 +466,6 @@ fn cmd_status_socket(state: &SharedState) -> String {
 
 // ─── 辅助函数 ───
 
-/// 将对象数据写入共享内存并返回响应字符串。
 fn write_get_result(state: &mut ServerState, data: Vec<u8>) -> String {
     if data.is_empty() {
         return "OK 0 0 0\n".into();
@@ -432,7 +480,6 @@ fn write_get_result(state: &mut ServerState, data: Vec<u8>) -> String {
     }
 }
 
-/// 格式化 UUID。
 fn uuid_fmt(uuid: &[u8; 16]) -> String {
     uuid.iter()
         .map(|b| format!("{b:02x}"))
@@ -440,7 +487,6 @@ fn uuid_fmt(uuid: &[u8; 16]) -> String {
         .join("")
 }
 
-/// 尝试将十六进制字符串解析为 UUID 字节数组。
 fn parse_uuid(s: &str) -> Option<[u8; 16]> {
     let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() != 32 {
