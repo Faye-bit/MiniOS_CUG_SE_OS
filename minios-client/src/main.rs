@@ -143,20 +143,29 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
 
     // 小文件：单次 PUT
     if total_size <= shm_capacity {
+        // 锁定页互斥锁，保护分配和写入的原子性
+        region.lock_page_mutex().unwrap();
         let page_alloc = make_page_alloc(&region);
         let pages_needed = ((total_size as u64 + 4095) / 4096) as u32;
         let start_page = page_alloc.alloc_pages(pages_needed).unwrap_or_else(|| {
+            region.unlock_page_mutex().unwrap();
             eprintln!("ERROR: not enough shared memory pages (need {pages_needed})");
             std::process::exit(1);
         });
 
         region.write_to_pages(start_page, &data);
+        region.unlock_page_mutex().unwrap();
+
         let cmd = format!(
             "PUT {obj_name} {total_size} {content_type} {tags_safe} {start_page} {pages_needed}\n"
         );
         let resp = socket_cmd(&cli.socket, &cmd);
         print!("{resp}");
+
+        // 服务端已释放页，客户端同步清理（幂等释放）
+        region.lock_page_mutex().unwrap();
         page_alloc.free_pages(start_page, pages_needed);
+        region.unlock_page_mutex().unwrap();
     } else {
         // 大文件：分块传输
         log_chunked_upload(&cli.socket, &region, &obj_name, &data, content_type, &tags_safe);
@@ -194,26 +203,36 @@ fn log_chunked_upload(
         let chunk = &data[offset..chunk_end];
         let chunk_size = chunk.len();
 
+        // 锁定页互斥锁，分配页并写入数据
+        region.lock_page_mutex().unwrap();
         let page_alloc = make_page_alloc(region);
         let pages_needed = ((chunk_size as u64 + 4095) / 4096) as u32;
         let start_page = page_alloc.alloc_pages(pages_needed).unwrap_or_else(|| {
+            region.unlock_page_mutex().unwrap();
             eprintln!("ERROR: not enough shm pages for chunk (need {pages_needed})");
             std::process::exit(1);
         });
 
         region.write_to_pages(start_page, chunk);
+        region.unlock_page_mutex().unwrap();
+
         let resp = socket_cmd(
             socket_path,
             &format!("PUT_CHUNK {name} {chunk_size} {start_page} {pages_needed}\n"),
         );
         if !resp.starts_with("OK") {
             eprint!("{resp}");
+            region.lock_page_mutex().unwrap();
             page_alloc.free_pages(start_page, pages_needed);
+            region.unlock_page_mutex().unwrap();
             return;
         }
 
         // 服务端已读取并释放页，客户端也更新本地跟踪
+        region.lock_page_mutex().unwrap();
         page_alloc.free_pages(start_page, pages_needed);
+        region.unlock_page_mutex().unwrap();
+
         offset = chunk_end;
 
         eprint!("\rUploading {name}: {}/{} bytes ({:.0}%)", offset, total_size, offset as f64 / total_size as f64 * 100.0);
@@ -252,11 +271,14 @@ fn cmd_get(cli: &Cli, id: &str, output: &Option<PathBuf>) {
     let num_pages: u32 = parts[3].parse().unwrap_or(0);
 
     let region = open_shm(&cli.shm_name);
-    let data = region.read_from_pages(start_page, size);
 
-    // 读取完毕后释放共享内存页
+    // 锁定页互斥锁，保护读取和释放的原子性
+    region.lock_page_mutex().unwrap();
+    let data = region.read_from_pages(start_page, size);
     let page_alloc = make_page_alloc(&region);
     page_alloc.free_pages(start_page, num_pages);
+    region.unlock_page_mutex().unwrap();
+
     drop(region);
 
     if let Some(out_path) = output {

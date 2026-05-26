@@ -2,6 +2,7 @@
 
 use crate::common::consts;
 use crate::common::error::{miniosError, miniosResult};
+use crate::shm::sync::ShmMutex;
 use std::ffi::CString;
 use std::io;
 
@@ -10,6 +11,7 @@ use std::io;
 /// 控制页（4096 bytes）布局：
 /// - ShmControlHeader（~32 bytes）
 /// - Page Bitmap（ceil(total_pages/8) bytes，8 字节对齐）
+/// - pthread_mutex_t（跨进程页分配锁）
 /// - 剩余空间保留
 /// - 数据页从 Page 1 开始
 #[repr(C)]
@@ -58,12 +60,21 @@ impl ShmControlHeader {
     }
 }
 
+/// 计算互斥锁在控制页中的偏移量（位图之后，按 pthread_mutex_t 对齐）。
+fn page_mutex_offset(bitmap_offset: u32, bitmap_size: u32) -> usize {
+    let raw = bitmap_offset as usize + bitmap_size as usize;
+    let align = std::mem::align_of::<libc::pthread_mutex_t>();
+    (raw + align - 1) / align * align
+}
+
 /// 共享内存区域。
 pub struct ShmRegion {
     ptr: *mut u8,
     size: usize,
     shm_fd: i32,
     name: String,
+    /// 保护页分配位图的跨进程互斥锁（位于控制页中）
+    page_mutex: ShmMutex,
 }
 
 unsafe impl Send for ShmRegion {}
@@ -75,12 +86,14 @@ impl ShmRegion {
 
         let header_size = std::mem::size_of::<ShmControlHeader>();
         let bitmap_size = ((num_data_pages as usize + 7) / 8 + 7) / 8 * 8;
+        let bitmap_offset = header_size as u32;
+        let bitmap_size_u32 = bitmap_size as u32;
+        let mutex_off = page_mutex_offset(bitmap_offset, bitmap_size_u32);
+        let mutex_size = std::mem::size_of::<libc::pthread_mutex_t>();
         assert!(
-            header_size + bitmap_size <= page_size,
-            "control page overflow: {} + {} > {}",
-            header_size,
-            bitmap_size,
-            page_size
+            mutex_off + mutex_size <= page_size,
+            "control page overflow: header={header_size} + bitmap={bitmap_size} + mutex={mutex_size} = {} > {page_size}",
+            mutex_off + mutex_size
         );
 
         let total_pages = 1 + num_data_pages as usize; // 1 控制页 + N 数据页
@@ -133,18 +146,23 @@ impl ShmRegion {
             )));
         }
 
+        let region_ptr = ptr as *mut u8;
+
         // 写入控制头（位图紧随 header 之后）
-        let bitmap_offset = header_size as u32;
-        let header = ShmControlHeader::new(num_data_pages, bitmap_offset, bitmap_size as u32);
+        let header = ShmControlHeader::new(num_data_pages, bitmap_offset, bitmap_size_u32);
         unsafe {
             std::ptr::write(ptr as *mut ShmControlHeader, header);
         }
 
+        // 在位图之后初始化跨进程互斥锁
+        let page_mutex = unsafe { ShmMutex::init_at(region_ptr.add(mutex_off))? };
+
         Ok(Self {
-            ptr: ptr as *mut u8,
+            ptr: region_ptr,
             size: region_size,
             shm_fd,
             name: name.to_string(),
+            page_mutex,
         })
     }
 
@@ -192,14 +210,23 @@ impl ShmRegion {
             )));
         }
 
-        let region = Self {
-            ptr: ptr as *mut u8,
+        let region_ptr = ptr as *mut u8;
+
+        // 在打开互斥锁前先验证控制头
+        let header_ref = unsafe { &*(region_ptr as *const ShmControlHeader) };
+        header_ref.validate()?;
+
+        // 计算互斥锁偏移并打开（不重新初始化）
+        let mutex_off = page_mutex_offset(header_ref.page_bitmap_offset, header_ref.page_bitmap_size);
+        let page_mutex = unsafe { ShmMutex::open_at(region_ptr.add(mutex_off)) };
+
+        Ok(Self {
+            ptr: region_ptr,
             size: region_size,
             shm_fd,
             name: name.to_string(),
-        };
-        region.header().validate()?;
-        Ok(region)
+            page_mutex,
+        })
     }
 
     /// 销毁共享内存区域，防止 Drop 重复释放。
@@ -208,6 +235,9 @@ impl ShmRegion {
         let size = self.size;
         let shm_fd = self.shm_fd;
         let name = std::mem::take(&mut self.name);
+
+        // 在 unmap 前销毁互斥锁
+        unsafe { self.page_mutex.destroy()?; }
 
         self.ptr = std::ptr::null_mut();
         self.shm_fd = -1;
@@ -244,6 +274,16 @@ impl ShmRegion {
 
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// 锁定页分配互斥锁（跨进程）。
+    pub fn lock_page_mutex(&self) -> miniosResult<()> {
+        self.page_mutex.lock()
+    }
+
+    /// 解锁页分配互斥锁（跨进程）。
+    pub fn unlock_page_mutex(&self) -> miniosResult<()> {
+        self.page_mutex.unlock()
     }
 
     /// 写数据到连续页面。

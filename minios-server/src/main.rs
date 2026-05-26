@@ -302,10 +302,14 @@ fn cmd_put_chunk(parts: &[&str], state: &SharedState) -> String {
         return "ERROR no pending upload for this name, send PUT_BEGIN first\n".into();
     }
 
-    // 从共享内存读取块数据（释放 borrow 后才访问 upload）
-    let chunk = server_state.region.read_from_pages(start_page, chunk_size);
-    // 释放页
-    server_state.page_alloc.free_pages(start_page, num_pages);
+    // 锁定页互斥锁后从共享内存读取块数据
+    let chunk = {
+        server_state.region.lock_page_mutex().unwrap();
+        let c = server_state.region.read_from_pages(start_page, chunk_size);
+        server_state.page_alloc.free_pages(start_page, num_pages);
+        server_state.region.unlock_page_mutex().unwrap();
+        c
+    };
 
     // 追加到上传缓冲区
     let upload = server_state.pending_uploads.get_mut(&name).unwrap();
@@ -369,16 +373,19 @@ fn cmd_put(parts: &[&str], state: &SharedState) -> String {
     };
 
     let mut server_state = state.lock().unwrap();
+
+    // 锁定页互斥锁，保护读取和释放操作的原子性
+    server_state.region.lock_page_mutex().unwrap();
     let data = server_state.region.read_from_pages(start_page, size);
+    server_state.page_alloc.free_pages(start_page, num_pages);
+    server_state.region.unlock_page_mutex().unwrap();
 
     match server_state.store.put(name, &data, content_type, tags) {
         Ok(uuid) => {
-            server_state.page_alloc.free_pages(start_page, num_pages);
             server_state.cache.put(uuid, data, name.into(), size);
             format!("OK {}\n", uuid_fmt(&uuid))
         }
         Err(e) => {
-            server_state.page_alloc.free_pages(start_page, num_pages);
             format!("ERROR {e}\n")
         }
     }
@@ -486,13 +493,17 @@ fn write_get_result(state: &mut ServerState, data: Vec<u8>) -> String {
         return "OK 0 0 0\n".into();
     }
     let pages_needed = ((data.len() as u64 + 4095) / 4096) as u32;
-    match state.page_alloc.alloc_pages(pages_needed) {
+    // 锁定页互斥锁，保护分配和写入的原子性
+    state.region.lock_page_mutex().unwrap();
+    let result = match state.page_alloc.alloc_pages(pages_needed) {
         Some(start_page) => {
             state.region.write_to_pages(start_page, &data);
             format!("OK {} {} {}\n", data.len(), start_page, pages_needed)
         }
         None => "ERROR no free shm pages\n".into(),
-    }
+    };
+    state.region.unlock_page_mutex().unwrap();
+    result
 }
 
 fn uuid_fmt(uuid: &[u8; 16]) -> String {
