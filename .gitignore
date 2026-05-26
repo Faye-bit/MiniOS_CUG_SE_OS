@@ -4,3 +4,9 @@
 *.swp
 *.swo
 store.odb
+
+# 本地开发文件（不上传至公开仓库）
+Cargo.lock
+Claude.md
+Design_Need.md
+outputs/
