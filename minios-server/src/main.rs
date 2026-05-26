@@ -1,12 +1,12 @@
-//! MinOS 对象存储服务端 — 守护进程入口。
+//! minios 对象存储服务端 — 守护进程入口。
 
 use clap::Parser;
-use minos_lib::cache::lru::LruCache;
-use minos_lib::common::consts;
-use minos_lib::daemon;
-use minos_lib::shm::page::PageAllocator;
-use minos_lib::shm::region::ShmRegion;
-use minos_lib::storage::engine::ObjectStore;
+use minios_lib::cache::lru::LruCache;
+use minios_lib::common::consts;
+use minios_lib::daemon;
+use minios_lib::shm::page::PageAllocator;
+use minios_lib::shm::region::ShmRegion;
+use minios_lib::storage::engine::ObjectStore;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[command(name = "minos-server", version, about = "MinOS object storage daemon")]
+#[command(name = "minios-server", version, about = "minios object storage daemon")]
 struct Args {
     #[arg(long, default_value = consts::DEFAULT_STORE_PATH)]
     store_path: String,
@@ -37,7 +37,7 @@ struct Args {
     max_clients: u32,
     #[arg(long, default_value_t = false)]
     daemon: bool,
-    #[arg(long, default_value = "/tmp/minos.pid")]
+    #[arg(long, default_value = "/tmp/minios.pid")]
     pidfile: String,
 }
 
@@ -70,7 +70,7 @@ fn main() {
         daemon::write_pidfile(&args.pidfile).expect("write pidfile");
     }
 
-    log::info!("MinOS server starting...");
+    log::info!("minios server starting...");
 
     let store = if Path::new(&args.store_path).exists() {
         log::info!("Opening existing store: {}", args.store_path);
@@ -206,7 +206,7 @@ fn main() {
 
     let _ = std::fs::remove_file(&args.socket_path);
     daemon::remove_pidfile(&args.pidfile);
-    log::info!("MinOS server stopped.");
+    log::info!("minios server stopped.");
 }
 
 // ─── Socket 客户端处理 ───
@@ -240,11 +240,7 @@ fn dispatch_command(msg: &str, state: &SharedState) -> String {
         "LIST" => cmd_list(state),
         "STATUS" => cmd_status(state),
         "STOP" => {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            unsafe {
-                let ptr = &daemon::is_shutdown_requested as *const _ as *mut AtomicBool;
-                (*ptr).store(true, Ordering::SeqCst);
-            }
+            daemon::request_shutdown();
             "OK shutting down\n".into()
         }
         _ => format!("ERROR unknown command '{}'\n", parts[0]),

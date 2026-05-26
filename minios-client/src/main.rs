@@ -1,4 +1,4 @@
-//! MinOS 客户端 — 命令行接口。
+//! minios 客户端 — 命令行接口。
 //!
 //! 命令：
 //! - put <file>       上传文件（自动分块传输）
@@ -8,15 +8,15 @@
 //! - status           查看服务端状态
 
 use clap::{Parser, Subcommand};
-use minos_lib::common::consts;
-use minos_lib::shm::page::PageAllocator;
-use minos_lib::shm::region::ShmRegion;
+use minios_lib::common::consts;
+use minios_lib::shm::page::PageAllocator;
+use minios_lib::shm::region::ShmRegion;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "minos", version, about = "MinOS object storage client")]
+#[command(name = "minios", version, about = "minios object storage client")]
 struct Cli {
     #[arg(long, default_value = consts::DEFAULT_SOCKET_PATH)]
     socket: String,
@@ -73,7 +73,7 @@ fn cmd_stop(cli: &Cli) {
 fn socket_cmd(socket_path: &str, command: &str) -> String {
     let mut stream = UnixStream::connect(socket_path).unwrap_or_else(|e| {
         eprintln!("ERROR: cannot connect to server at '{socket_path}': {e}");
-        eprintln!("Is the minos-server running?");
+        eprintln!("Is the minios-server running?");
         std::process::exit(1);
     });
     stream.write_all(command.as_bytes()).unwrap();
@@ -86,7 +86,7 @@ fn socket_cmd(socket_path: &str, command: &str) -> String {
 fn open_shm(name: &str) -> ShmRegion {
     ShmRegion::open(name).unwrap_or_else(|e| {
         eprintln!("ERROR: cannot open shared memory '{name}': {e}");
-        eprintln!("Is the minos-server running?");
+        eprintln!("Is the minios-server running?");
         std::process::exit(1);
     })
 }

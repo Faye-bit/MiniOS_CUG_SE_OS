@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "minos-lib",
-    "minos-server",
-    "minos-client",
+    "minios-lib",
+    "minios-server",
+    "minios-client",
 ]

@@ -1,11 +1,11 @@
 [package]
-name = "minos-server"
+name = "minios-server"
 version = "0.1.0"
 edition = "2021"
-description = "MinOS object storage server daemon"
+description = "minios object storage server daemon"
 
 [dependencies]
-minos-lib = { path = "../minos-lib" }
+minios-lib = { path = "../minios-lib" }
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"

@@ -6,7 +6,7 @@
 //! ## 平台要求
 //! 仅在 Linux 上使用，依赖 `PTHREAD_PROCESS_SHARED` 和 `sem_open`。
 
-use crate::common::error::{MinosError, MinosResult};
+use crate::common::error::{miniosError, miniosResult};
 use std::ffi::CString;
 
 /// 跨进程互斥锁。
@@ -29,13 +29,13 @@ impl ShmMutex {
     /// # Safety
     /// - `ptr` 必须指向共享内存区域中足够大的有效地址（至少 `sizeof(pthread_mutex_t)` 字节）
     /// - 每个互斥锁只能初始化一次
-    pub unsafe fn init_at(ptr: *mut u8) -> MinosResult<Self> {
+    pub unsafe fn init_at(ptr: *mut u8) -> miniosResult<Self> {
         let mutex_ptr = ptr as *mut libc::pthread_mutex_t;
 
         let mut attr: libc::pthread_mutexattr_t = unsafe { std::mem::zeroed() };
         let ret = unsafe { libc::pthread_mutexattr_init(&mut attr) };
         if ret != 0 {
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "pthread_mutexattr_init failed: {ret}"
             )));
         }
@@ -45,7 +45,7 @@ impl ShmMutex {
         };
         if ret != 0 {
             unsafe { libc::pthread_mutexattr_destroy(&mut attr) };
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "pthread_mutexattr_setpshared failed: {ret}"
             )));
         }
@@ -53,7 +53,7 @@ impl ShmMutex {
         let ret = unsafe { libc::pthread_mutex_init(mutex_ptr, &attr) };
         unsafe { libc::pthread_mutexattr_destroy(&mut attr) };
         if ret != 0 {
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "pthread_mutex_init failed: {ret}"
             )));
         }
@@ -72,20 +72,20 @@ impl ShmMutex {
     }
 
     /// 锁定互斥锁。
-    pub fn lock(&self) -> MinosResult<()> {
+    pub fn lock(&self) -> miniosResult<()> {
         let ret = unsafe { libc::pthread_mutex_lock(self.ptr) };
         if ret != 0 {
-            Err(MinosError::ShmError(format!("pthread_mutex_lock failed: {ret}")))
+            Err(miniosError::ShmError(format!("pthread_mutex_lock failed: {ret}")))
         } else {
             Ok(())
         }
     }
 
     /// 解锁互斥锁。
-    pub fn unlock(&self) -> MinosResult<()> {
+    pub fn unlock(&self) -> miniosResult<()> {
         let ret = unsafe { libc::pthread_mutex_unlock(self.ptr) };
         if ret != 0 {
-            Err(MinosError::ShmError(format!("pthread_mutex_unlock failed: {ret}")))
+            Err(miniosError::ShmError(format!("pthread_mutex_unlock failed: {ret}")))
         } else {
             Ok(())
         }
@@ -95,10 +95,10 @@ impl ShmMutex {
     ///
     /// # Safety
     /// 仅在互斥锁不再被任何进程使用时调用。
-    pub unsafe fn destroy(&self) -> MinosResult<()> {
+    pub unsafe fn destroy(&self) -> miniosResult<()> {
         let ret = unsafe { libc::pthread_mutex_destroy(self.ptr) };
         if ret != 0 {
-            Err(MinosError::ShmError(format!("pthread_mutex_destroy failed: {ret}")))
+            Err(miniosError::ShmError(format!("pthread_mutex_destroy failed: {ret}")))
         } else {
             Ok(())
         }
@@ -125,11 +125,11 @@ unsafe impl Sync for ShmSemaphore {}
 impl ShmSemaphore {
     /// 创建一个命名信号量（如果已存在则打开）。
     ///
-    /// `name` 是信号量名称（不含 `/` 前缀），例如 `"minos_server_sem"`。
+    /// `name` 是信号量名称（不含 `/` 前缀），例如 `"minios_server_sem"`。
     /// `value` 是初始值。
-    pub fn create(name: &str, value: u32) -> MinosResult<Self> {
+    pub fn create(name: &str, value: u32) -> miniosResult<Self> {
         let cname = CString::new(name).map_err(|e| {
-            MinosError::ShmError(format!("invalid semaphore name '{name}': {e}"))
+            miniosError::ShmError(format!("invalid semaphore name '{name}': {e}"))
         })?;
 
         let sem = unsafe {
@@ -154,7 +154,7 @@ impl ShmSemaphore {
                 )
             };
             if sem == libc::SEM_FAILED {
-                return Err(MinosError::ShmError(format!(
+                return Err(miniosError::ShmError(format!(
                     "sem_open('{name}') failed after unlink: {err}"
                 )));
             }
@@ -165,15 +165,15 @@ impl ShmSemaphore {
     }
 
     /// 打开一个已存在的命名信号量。
-    pub fn open(name: &str) -> MinosResult<Self> {
+    pub fn open(name: &str) -> miniosResult<Self> {
         let cname = CString::new(name).map_err(|e| {
-            MinosError::ShmError(format!("invalid semaphore name '{name}': {e}"))
+            miniosError::ShmError(format!("invalid semaphore name '{name}': {e}"))
         })?;
 
         let sem = unsafe { libc::sem_open(cname.as_ptr(), 0) };
         if sem == libc::SEM_FAILED {
             let err = std::io::Error::last_os_error();
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "sem_open('{name}') failed: {err}"
             )));
         }
@@ -183,11 +183,11 @@ impl ShmSemaphore {
 
     /// 等待信号量（P 操作，减 1）。
     /// 如果当前值为 0 则阻塞。
-    pub fn wait(&self) -> MinosResult<()> {
+    pub fn wait(&self) -> miniosResult<()> {
         let ret = unsafe { libc::sem_wait(self.sem) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            Err(MinosError::ShmError(format!("sem_wait failed: {err}")))
+            Err(miniosError::ShmError(format!("sem_wait failed: {err}")))
         } else {
             Ok(())
         }
@@ -195,14 +195,14 @@ impl ShmSemaphore {
 
     /// 非阻塞尝试等待信号量。
     /// 如果当前值为 0 则立即返回错误。
-    pub fn try_wait(&self) -> MinosResult<()> {
+    pub fn try_wait(&self) -> miniosResult<()> {
         let ret = unsafe { libc::sem_trywait(self.sem) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EAGAIN) {
-                Err(MinosError::ShmError("semaphore would block".into()))
+                Err(miniosError::ShmError("semaphore would block".into()))
             } else {
-                Err(MinosError::ShmError(format!("sem_trywait failed: {err}")))
+                Err(miniosError::ShmError(format!("sem_trywait failed: {err}")))
             }
         } else {
             Ok(())
@@ -210,22 +210,22 @@ impl ShmSemaphore {
     }
 
     /// 发送信号量（V 操作，加 1）。
-    pub fn post(&self) -> MinosResult<()> {
+    pub fn post(&self) -> miniosResult<()> {
         let ret = unsafe { libc::sem_post(self.sem) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            Err(MinosError::ShmError(format!("sem_post failed: {err}")))
+            Err(miniosError::ShmError(format!("sem_post failed: {err}")))
         } else {
             Ok(())
         }
     }
 
     /// 关闭信号量并删除其名称（清理资源）。
-    pub fn close_and_unlink(self) -> MinosResult<()> {
+    pub fn close_and_unlink(self) -> miniosResult<()> {
         let ret = unsafe { libc::sem_close(self.sem) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            return Err(MinosError::ShmError(format!("sem_close failed: {err}")));
+            return Err(miniosError::ShmError(format!("sem_close failed: {err}")));
         }
         let ret = unsafe { libc::sem_unlink(self.name.as_ptr()) };
         if ret != 0 {
@@ -237,11 +237,11 @@ impl ShmSemaphore {
     }
 
     /// 只关闭不删除名称（客户端使用）。
-    pub fn close(self) -> MinosResult<()> {
+    pub fn close(self) -> miniosResult<()> {
         let ret = unsafe { libc::sem_close(self.sem) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            return Err(MinosError::ShmError(format!("sem_close failed: {err}")));
+            return Err(miniosError::ShmError(format!("sem_close failed: {err}")));
         }
         Ok(())
     }
@@ -249,8 +249,8 @@ impl ShmSemaphore {
 
 /// 信号量名称常量
 pub mod names {
-    pub const SERVER_SEM: &str = "minos_server_sem";
-    pub const CLIENT_SEM: &str = "minos_client_sem";
+    pub const SERVER_SEM: &str = "minios_server_sem";
+    pub const CLIENT_SEM: &str = "minios_client_sem";
 }
 
 // ─── 单元测试 ───
@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_semaphore_create_wait_post() {
-        let sem = ShmSemaphore::create("minos_test_sem", 1).unwrap();
+        let sem = ShmSemaphore::create("minios_test_sem", 1).unwrap();
         sem.wait().unwrap(); // 消费掉初始值
         sem.post().unwrap(); // 加回来
         sem.wait().unwrap();
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_semaphore_try_wait() {
-        let sem = ShmSemaphore::create("minos_test_try_sem", 0).unwrap();
+        let sem = ShmSemaphore::create("minios_test_try_sem", 0).unwrap();
         assert!(sem.try_wait().is_err()); // 值为 0，不应能拿到
         sem.post().unwrap();
         sem.try_wait().unwrap(); // 现在可以了

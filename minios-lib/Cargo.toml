@@ -1,8 +1,8 @@
 [package]
-name = "minos-lib"
+name = "minios-lib"
 version = "0.1.0"
 edition = "2021"
-description = "MinOS object storage core library"
+description = "minios object storage core library"
 
 [dependencies]
 uuid = { version = "1", features = ["v4"] }

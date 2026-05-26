@@ -34,10 +34,10 @@ pub const MAX_TAGS_LEN: usize = 63;
 pub const SHM_PAGE_SIZE: u32 = 4096;
 
 /// 默认 Unix Domain Socket 路径
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/minos.sock";
+pub const DEFAULT_SOCKET_PATH: &str = "/tmp/minios.sock";
 
 /// 默认共享内存名称
-pub const DEFAULT_SHM_NAME: &str = "minos_shm";
+pub const DEFAULT_SHM_NAME: &str = "minios_shm";
 
 /// 默认存储文件路径
 pub const DEFAULT_STORE_PATH: &str = "./store.odb";

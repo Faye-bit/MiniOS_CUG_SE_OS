@@ -1,10 +1,10 @@
 [package]
-name = "minos-client"
+name = "minios-client"
 version = "0.1.0"
 edition = "2021"
-description = "MinOS object storage client CLI"
+description = "minios object storage client CLI"
 
 [dependencies]
-minos-lib = { path = "../minos-lib" }
+minios-lib = { path = "../minios-lib" }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"

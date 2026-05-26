@@ -1,0 +1,44 @@
+dgy@dgy-Ubuntu:~/桌面/MiniOS_CUG_SE_OS$ ./target/release/minos-server --store-path /tmp/test_store.odb > /tmp/minos.log 2>&1 &
+SERVER_PID=$!
+sleep 1
+[1] 32538
+dgy@dgy-Ubuntu:~/桌面/MiniOS_CUG_SE_OS$ echo "Hello, MiniOS!" > /tmp/test_file.txt
+./target/release/minos-client put /tmp/test_file.txt --name hello
+./target/release/minos-client list
+./target/release/minos-client get hello
+./target/release/minos-client status
+OK b7030a712a5c43b5b86b3297ced92294
+OK 1
+b7030a712a5c43b5b86b3297ced92294 hello 15 application/octet-stream 1779807208
+Hello, MiniOS!
+OK
+store_objects: 1
+store_blocks_free: 4095/4096
+store_file_size: 17047552
+cache_entries: 1/128
+cache_hit_rate: 0.00
+shm_pages_free: 256/256
+dgy@dgy-Ubuntu:~/桌面/MiniOS_CUG_SE_OS$ dd if=/dev/urandom of=/tmp/large.bin bs=1M count=10 2>/dev/null
+./target/release/minos-client put /tmp/large.bin --name large-test
+Uploading large-test: 10485760/10485760 bytes (100%)
+OK 63290eb70c0045c5aefe039918b48f45
+dgy@dgy-Ubuntu:~/桌面/MiniOS_CUG_SE_OS$ ./target/release/minos-client list
+OK 2
+b7030a712a5c43b5b86b3297ced92294 hello 15 application/octet-stream 1779807208
+63290eb70c0045c5aefe039918b48f45 large-test 10485760 application/octet-stream 1779807223
+dgy@dgy-Ubuntu:~/桌面/MiniOS_CUG_SE_OS$ kill $SERVER_PID && wait $SERVER_PID
+./target/release/minos-server --store-path /tmp/test_store.odb > /tmp/minos.log 2>&1 &
+SERVER_PID=$!
+sleep 1
+./target/release/minos-client list
+[1]+  已完成               ./target/release/minos-server --store-path /tmp/test_store.odb > /tmp/minos.log 2>&1
+[1] 32606
+OK 2
+b7030a712a5c43b5b86b3297ced92294 hello 15 application/octet-stream 1779807208
+63290eb70c0045c5aefe039918b48f45 large-test 10485760 application/octet-stream 1779807223
+dgy@dgy-Ubuntu:~/桌面/MiniOS_CUG_SE_OS$ ./target/release/minos-client get hello
+Hello, MiniOS!
+dgy@dgy-Ubuntu:~/桌面/MiniOS_CUG_SE_OS$ ./target/release/minos-client stop 2>/dev/null || kill $SERVER_PID 2>/dev/null
+rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minos.log /tmp/minos.sock
+[1]+  段错误               ./target/release/minos-server --store-path /tmp/test_store.odb > /tmp/minos.log 2>&1
+

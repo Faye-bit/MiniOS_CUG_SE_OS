@@ -2,9 +2,9 @@
 
 use thiserror::Error;
 
-/// MinOS 库所有可能的错误类型。
+/// minios 库所有可能的错误类型。
 #[derive(Error, Debug)]
-pub enum MinosError {
+pub enum miniosError {
     /// I/O 错误
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -51,4 +51,4 @@ pub enum MinosError {
 }
 
 /// 库级别的 Result 类型别名。
-pub type MinosResult<T> = Result<T, MinosError>;
+pub type miniosResult<T> = Result<T, miniosError>;

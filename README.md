@@ -1,4 +1,4 @@
-# MinOS — Mini Object Storage
+# minios — Mini Object Storage
 
 简单对象存储服务，采用扁平化命名空间管理数据。所有对象持久化到单一复合文档文件 `store.odb`，通过 Unix Domain Socket + POSIX 共享内存双通道进行进程间通信。
 
@@ -24,8 +24,8 @@ cargo build --release
 ```
 
 编译产物位于 `target/release/` 目录：
-- `minos-server` — 服务端守护进程
-- `minos-client` (或 `minos`) — 命令行客户端
+- `minios-server` — 服务端守护进程
+- `minios-client` (或 `minios`) — 命令行客户端
 
 ---
 
@@ -34,10 +34,10 @@ cargo build --release
 ### 前台模式（调试用）
 
 ```bash
-./target/release/minos-server \
+./target/release/minios-server \
     --store-path ./store.odb \
-    --socket-path /tmp/minos.sock \
-    --shm-name /minos_shm \
+    --socket-path /tmp/minios.sock \
+    --shm-name /minios_shm \
     --shm-pages 256 \
     --cache-capacity 128 \
     --cache-memory-mb 64 \
@@ -49,7 +49,7 @@ cargo build --release
 
 ```bash
 # 重定向输出，避免干扰终端
-./target/release/minos-server --store-path /tmp/test_store.odb > /tmp/minos.log 2>&1 &
+./target/release/minios-server --store-path /tmp/test_store.odb > /tmp/minios.log 2>&1 &
 SERVER_PID=$!
 sleep 1
 ```
@@ -57,23 +57,23 @@ sleep 1
 ### 守护进程模式
 
 ```bash
-./target/release/minos-server \
+./target/release/minios-server \
     --daemon \
-    --pidfile /tmp/minos.pid \
-    --store-path /var/lib/minos/store.odb
+    --pidfile /tmp/minios.pid \
+    --store-path /var/lib/minios/store.odb
 ```
 
 ### 停止服务
 
 ```bash
 # 方式1：客户端 stop 命令（推荐，同步返回结果）
-./target/release/minos-client stop
+./target/release/minios-client stop
 
 # 方式2：发送 SIGTERM 后等待进程退出
 kill $SERVER_PID && wait $SERVER_PID
 
 # 方式3：通过 PID 文件
-kill $(cat /tmp/minos.pid)
+kill $(cat /tmp/minios.pid)
 ```
 
 ### 命令行参数
@@ -81,8 +81,8 @@ kill $(cat /tmp/minos.pid)
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--store-path` | `./store.odb` | 存储文件路径 |
-| `--socket-path` | `/tmp/minos.sock` | Unix Socket 路径 |
-| `--shm-name` | `/minos_shm` | 共享内存名称 |
+| `--socket-path` | `/tmp/minios.sock` | Unix Socket 路径 |
+| `--shm-name` | `/minios_shm` | 共享内存名称 |
 | `--shm-pages` | `256` | 共享内存数据页数 |
 | `--cache-capacity` | `128` | LRU 缓存条目容量 |
 | `--cache-memory-mb` | `64` | LRU 缓存最大内存 (MB) |
@@ -90,7 +90,7 @@ kill $(cat /tmp/minos.pid)
 | `--total-blocks` | `4096` | 数据块总数 (每个 4KB) |
 | `--max-clients` | `16` | 最大并发客户端数 |
 | `--daemon` | `false` | 以守护进程方式运行 |
-| `--pidfile` | `/tmp/minos.pid` | PID 文件路径 |
+| `--pidfile` | `/tmp/minios.pid` | PID 文件路径 |
 
 ---
 
@@ -98,48 +98,48 @@ kill $(cat /tmp/minos.pid)
 
 ```bash
 # 设置别名
-alias minos="./target/release/minos-client"
+alias minios="./target/release/minios-client"
 ```
 
 ### 上传文件
 
 ```bash
 # 基本用法（对象名默认为文件名）
-minos put ./hello.txt
+minios put ./hello.txt
 
 # 指定名称和类型
-minos put ./data.bin --name my-data --content-type application/octet-stream
+minios put ./data.bin --name my-data --content-type application/octet-stream
 
 # 添加自定义标签
-minos put ./photo.jpg --name avatar --content-type image/jpeg --tags '{"user":"alice","size":"large"}'
+minios put ./photo.jpg --name avatar --content-type image/jpeg --tags '{"user":"alice","size":"large"}'
 
 # 连接远程服务端
-minos --socket /tmp/minos.sock put ./file.bin
+minios --socket /tmp/minios.sock put ./file.bin
 ```
 
 ### 下载对象
 
 ```bash
 # 通过 UUID 下载
-minos get 550e8400-e29b-41d4-a716-446655440000
+minios get 550e8400-e29b-41d4-a716-446655440000
 
 # 通过名称下载
-minos get hello.txt
+minios get hello.txt
 
 # 保存到文件
-minos get hello.txt --output ./downloaded.txt
+minios get hello.txt --output ./downloaded.txt
 ```
 
 ### 删除对象
 
 ```bash
-minos delete 550e8400-e29b-41d4-a716-446655440000
+minios delete 550e8400-e29b-41d4-a716-446655440000
 ```
 
 ### 列出所有对象
 
 ```bash
-minos list
+minios list
 ```
 
 输出示例：
@@ -152,7 +152,7 @@ LIST 2
 ### 查看服务状态
 
 ```bash
-minos status
+minios status
 ```
 
 输出示例：
@@ -177,50 +177,50 @@ shm_pages_free: 250/256
 cargo test
 
 # 运行特定模块
-cargo test -p minos-lib --lib storage::       # 存储引擎 (37 个)
-cargo test -p minos-lib --lib shm::           # 共享内存 (11 个，部分需 Linux)
-cargo test -p minos-lib --lib cache::         # LRU 缓存 (9 个)
+cargo test -p minios-lib --lib storage::       # 存储引擎 (37 个)
+cargo test -p minios-lib --lib shm::           # 共享内存 (11 个，部分需 Linux)
+cargo test -p minios-lib --lib cache::         # LRU 缓存 (9 个)
 
 # 显示测试输出
 cargo test -- --nocapture
 
 # 运行单个测试
-cargo test -p minos-lib --lib storage::engine::tests::test_put_large_object_spans_blocks
+cargo test -p minios-lib --lib storage::engine::tests::test_put_large_object_spans_blocks
 ```
 
 ### 集成测试（手动）
 
 ```bash
 # 0. 清理残留
-rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minos.sock
+rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minios.sock
 
 # 1. 启动服务端（后台 + 重定向日志）
-./target/release/minos-server --store-path /tmp/test_store.odb > /tmp/minos.log 2>&1 &
+./target/release/minios-server --store-path /tmp/test_store.odb > /tmp/minios.log 2>&1 &
 SERVER_PID=$!
 sleep 1
 
 # 2. 基本操作流程
 echo "Hello, MiniOS!" > /tmp/test_file.txt
-./target/release/minos-client put /tmp/test_file.txt --name hello
-./target/release/minos-client list
-./target/release/minos-client get hello
-./target/release/minos-client status
+./target/release/minios-client put /tmp/test_file.txt --name hello
+./target/release/minios-client list
+./target/release/minios-client get hello
+./target/release/minios-client status
 
 # 3. 大对象测试（10MB，自动分块传输）
 dd if=/dev/urandom of=/tmp/large.bin bs=1M count=10 2>/dev/null
-./target/release/minos-client put /tmp/large.bin --name large-test
+./target/release/minios-client put /tmp/large.bin --name large-test
 
 # 4. 重启持久化测试
 kill $SERVER_PID && wait $SERVER_PID
-./target/release/minos-server --store-path /tmp/test_store.odb > /tmp/minos.log 2>&1 &
+./target/release/minios-server --store-path /tmp/test_store.odb > /tmp/minios.log 2>&1 &
 SERVER_PID=$!
 sleep 1
-./target/release/minos-client list   # 应显示之前的对象
-./target/release/minos-client get hello
+./target/release/minios-client list   # 应显示之前的对象
+./target/release/minios-client get hello
 
 # 5. 清理
-./target/release/minos-client stop 2>/dev/null || kill $SERVER_PID 2>/dev/null
-rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minos.log /tmp/minos.sock
+./target/release/minios-client stop 2>/dev/null || kill $SERVER_PID 2>/dev/null
+rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minios.log /tmp/minios.sock
 ```
 
 ### 并发测试
@@ -233,12 +233,12 @@ done
 wait
 
 for i in $(seq 1 10); do
-    ./target/release/minos-client put "/tmp/concurrent_$i.txt" --name "concurrent-$i" &
+    ./target/release/minios-client put "/tmp/concurrent_$i.txt" --name "concurrent-$i" &
 done
 wait
 
 # 验证
-./target/release/minos-client list | grep concurrent
+./target/release/minios-client list | grep concurrent
 ```
 
 ---
@@ -252,7 +252,7 @@ MiniOS/
 ├── README.md               # 本文件
 ├── .gitignore
 │
-├── minos-lib/              # 核心库
+├── minios-lib/              # 核心库
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
@@ -277,11 +277,11 @@ MiniOS/
 │       └── daemon/         # 守护进程管理
 │           └── mod.rs          # double-fork, 信号, PID 文件
 │
-├── minos-server/           # 服务端入口
+├── minios-server/           # 服务端入口
 │   ├── Cargo.toml
 │   └── src/main.rs
 │
-└── minos-client/           # 客户端入口
+└── minios-client/           # 客户端入口
     ├── Cargo.toml
     └── src/main.rs
 ```

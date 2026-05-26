@@ -1,6 +1,6 @@
 //! 守护进程管理 — double-fork 守护进程化、PID 文件、信号处理。
 
-use crate::common::error::{MinosError, MinosResult};
+use crate::common::error::{miniosError, miniosResult};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -14,23 +14,28 @@ pub fn is_shutdown_requested() -> bool {
     SHUTDOWN_FLAG.load(Ordering::SeqCst)
 }
 
+/// 请求关闭服务（由客户端 STOP 命令调用）。
+pub fn request_shutdown() {
+    SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+}
+
 /// 注册信号处理器（SIGTERM, SIGINT → 设置关闭标志）。
-pub fn setup_signal_handlers() -> MinosResult<()> {
+pub fn setup_signal_handlers() -> miniosResult<()> {
     unsafe {
         // SIGTERM
         let ret = libc::signal(libc::SIGTERM, handle_signal as *const () as libc::sighandler_t);
         if ret == libc::SIG_ERR {
-            return Err(MinosError::DaemonError("failed to set SIGTERM handler".into()));
+            return Err(miniosError::DaemonError("failed to set SIGTERM handler".into()));
         }
         // SIGINT
         let ret = libc::signal(libc::SIGINT, handle_signal as *const () as libc::sighandler_t);
         if ret == libc::SIG_ERR {
-            return Err(MinosError::DaemonError("failed to set SIGINT handler".into()));
+            return Err(miniosError::DaemonError("failed to set SIGINT handler".into()));
         }
         // 忽略 SIGPIPE（防止写入已关闭的 socket 时崩溃）
         let ret = libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         if ret == libc::SIG_ERR {
-            return Err(MinosError::DaemonError("failed to set SIGPIPE handler".into()));
+            return Err(miniosError::DaemonError("failed to set SIGPIPE handler".into()));
         }
     }
     Ok(())
@@ -48,12 +53,12 @@ extern "C" fn handle_signal(_sig: i32) {
 /// 3. 再次 fork → 第一个子进程退出（确保进程不是会话领导，无法重新获取终端）
 /// 4. chdir("/") → 避免占用挂载点
 /// 5. 关闭标准输入输出
-pub fn daemonize() -> MinosResult<()> {
+pub fn daemonize() -> miniosResult<()> {
     unsafe {
         // 第一次 fork
         match libc::fork() {
             -1 => {
-                return Err(MinosError::DaemonError("first fork failed".into()));
+                return Err(miniosError::DaemonError("first fork failed".into()));
             }
             0 => {
                 // 子进程继续
@@ -66,13 +71,13 @@ pub fn daemonize() -> MinosResult<()> {
 
         // 创建新会话
         if libc::setsid() == -1 {
-            return Err(MinosError::DaemonError("setsid failed".into()));
+            return Err(miniosError::DaemonError("setsid failed".into()));
         }
 
         // 第二次 fork
         match libc::fork() {
             -1 => {
-                return Err(MinosError::DaemonError("second fork failed".into()));
+                return Err(miniosError::DaemonError("second fork failed".into()));
             }
             0 => {
                 // 孙进程继续
@@ -112,11 +117,11 @@ pub fn daemonize() -> MinosResult<()> {
 }
 
 /// 写入 PID 文件。
-pub fn write_pidfile(path: impl AsRef<Path>) -> MinosResult<()> {
+pub fn write_pidfile(path: impl AsRef<Path>) -> miniosResult<()> {
     let pid = std::process::id();
     let content = format!("{pid}\n");
     fs::write(path.as_ref(), content).map_err(|e| {
-        MinosError::DaemonError(format!(
+        miniosError::DaemonError(format!(
             "cannot write pidfile '{}': {}",
             path.as_ref().display(),
             e
@@ -126,23 +131,23 @@ pub fn write_pidfile(path: impl AsRef<Path>) -> MinosResult<()> {
 }
 
 /// 读取 PID 文件内容，返回 PID。
-pub fn read_pidfile(path: impl AsRef<Path>) -> MinosResult<u32> {
+pub fn read_pidfile(path: impl AsRef<Path>) -> miniosResult<u32> {
     let mut content = String::new();
     fs::File::open(path.as_ref())
         .map_err(|e| {
-            MinosError::DaemonError(format!(
+            miniosError::DaemonError(format!(
                 "cannot open pidfile '{}': {}",
                 path.as_ref().display(),
                 e
             ))
         })?
         .read_to_string(&mut content)
-        .map_err(|e| MinosError::DaemonError(format!("cannot read pidfile: {e}")))?;
+        .map_err(|e| miniosError::DaemonError(format!("cannot read pidfile: {e}")))?;
 
     content
         .trim()
         .parse()
-        .map_err(|e| MinosError::DaemonError(format!("invalid pid in pidfile: {e}")))
+        .map_err(|e| miniosError::DaemonError(format!("invalid pid in pidfile: {e}")))
 }
 
 /// 删除 PID 文件。
@@ -151,11 +156,11 @@ pub fn remove_pidfile(path: impl AsRef<Path>) {
 }
 
 /// 向进程发送信号。
-pub fn send_signal(pid: u32, signal: i32) -> MinosResult<()> {
+pub fn send_signal(pid: u32, signal: i32) -> miniosResult<()> {
     let ret = unsafe { libc::kill(pid as libc::pid_t, signal) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        Err(MinosError::DaemonError(format!(
+        Err(miniosError::DaemonError(format!(
             "kill({pid}, {signal}) failed: {err}"
         )))
     } else {

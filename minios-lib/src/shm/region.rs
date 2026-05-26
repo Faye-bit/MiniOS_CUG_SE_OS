@@ -1,7 +1,7 @@
 //! 共享内存区域（ShmRegion）— POSIX 共享内存生命周期管理。
 
 use crate::common::consts;
-use crate::common::error::{MinosError, MinosResult};
+use crate::common::error::{miniosError, miniosResult};
 use std::ffi::CString;
 use std::io;
 
@@ -44,12 +44,12 @@ impl ShmControlHeader {
         }
     }
 
-    pub fn validate(&self) -> MinosResult<()> {
+    pub fn validate(&self) -> miniosResult<()> {
         if self.magic != consts::SHM_MAGIC {
-            return Err(MinosError::ShmError("bad shm magic".into()));
+            return Err(miniosError::ShmError("bad shm magic".into()));
         }
         if self.page_size != consts::SHM_PAGE_SIZE {
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "unsupported page size: {}",
                 self.page_size
             )));
@@ -70,7 +70,7 @@ unsafe impl Send for ShmRegion {}
 
 impl ShmRegion {
     /// 创建共享内存区域（服务端调用）。
-    pub fn create(name: &str, num_data_pages: u32) -> MinosResult<Self> {
+    pub fn create(name: &str, num_data_pages: u32) -> miniosResult<Self> {
         let page_size = consts::SHM_PAGE_SIZE as usize;
 
         let header_size = std::mem::size_of::<ShmControlHeader>();
@@ -87,14 +87,14 @@ impl ShmRegion {
         let region_size = total_pages * page_size;
 
         let cname = CString::new(name).map_err(|e| {
-            MinosError::ShmError(format!("invalid shm name: {e}"))
+            miniosError::ShmError(format!("invalid shm name: {e}"))
         })?;
 
         unsafe { libc::shm_unlink(cname.as_ptr()) };
 
         let shm_fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
         if shm_fd < 0 {
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "shm_open failed: {}",
                 io::Error::last_os_error()
             )));
@@ -106,7 +106,7 @@ impl ShmRegion {
                 libc::close(shm_fd);
                 libc::shm_unlink(cname.as_ptr());
             };
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "ftruncate failed: {}",
                 io::Error::last_os_error()
             )));
@@ -127,7 +127,7 @@ impl ShmRegion {
                 libc::close(shm_fd);
                 libc::shm_unlink(cname.as_ptr());
             };
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "mmap failed: {}",
                 io::Error::last_os_error()
             )));
@@ -149,14 +149,14 @@ impl ShmRegion {
     }
 
     /// 打开已存在的共享内存区域（客户端调用）。
-    pub fn open(name: &str) -> MinosResult<Self> {
+    pub fn open(name: &str) -> miniosResult<Self> {
         let cname = CString::new(name).map_err(|e| {
-            MinosError::ShmError(format!("invalid shm name: {e}"))
+            miniosError::ShmError(format!("invalid shm name: {e}"))
         })?;
 
         let shm_fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0o600) };
         if shm_fd < 0 {
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "shm_open '{}' failed: {}",
                 name,
                 io::Error::last_os_error()
@@ -167,7 +167,7 @@ impl ShmRegion {
         let ret = unsafe { libc::fstat(shm_fd, &mut stat) };
         if ret != 0 {
             unsafe { libc::close(shm_fd) };
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "fstat failed: {}",
                 io::Error::last_os_error()
             )));
@@ -186,7 +186,7 @@ impl ShmRegion {
         };
         if ptr == libc::MAP_FAILED {
             unsafe { libc::close(shm_fd) };
-            return Err(MinosError::ShmError(format!(
+            return Err(miniosError::ShmError(format!(
                 "mmap failed: {}",
                 io::Error::last_os_error()
             )));
@@ -203,7 +203,7 @@ impl ShmRegion {
     }
 
     /// 销毁共享内存区域，防止 Drop 重复释放。
-    pub fn destroy(mut self) -> MinosResult<()> {
+    pub fn destroy(mut self) -> miniosResult<()> {
         let ptr = self.ptr;
         let size = self.size;
         let shm_fd = self.shm_fd;
@@ -290,7 +290,7 @@ mod tests {
     use super::*;
 
     fn test_name(suffix: &str) -> String {
-        format!("/minos_test_region_{suffix}")
+        format!("/minios_test_region_{suffix}")
     }
 
     #[test]

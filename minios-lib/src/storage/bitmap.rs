@@ -5,7 +5,7 @@
 //!
 //! 数据块不需要连续分配——它们通过块内的 next 指针形成链表。
 
-use crate::common::error::{MinosError, MinosResult};
+use crate::common::error::{miniosError, miniosResult};
 
 /// 自由块位图。
 ///
@@ -106,9 +106,9 @@ impl BlockBitmap {
     /// 分配 `count` 个空闲块，返回块索引列表。
     ///
     /// 块不需要连续，因为它们通过链表指针串联。
-    pub fn allocate_multi(&mut self, count: u32) -> MinosResult<Vec<u64>> {
+    pub fn allocate_multi(&mut self, count: u32) -> miniosResult<Vec<u64>> {
         if count as u64 > self.free_blocks {
-            return Err(MinosError::NoSpace(format!(
+            return Err(miniosError::NoSpace(format!(
                 "need {} blocks but only {} free",
                 count, self.free_blocks
             )));
@@ -123,7 +123,7 @@ impl BlockBitmap {
                     for idx in &allocated {
                         self.free_block(*idx);
                     }
-                    return Err(MinosError::NoSpace(
+                    return Err(miniosError::NoSpace(
                         "allocation failed mid-way (unexpected)".into(),
                     ));
                 }
