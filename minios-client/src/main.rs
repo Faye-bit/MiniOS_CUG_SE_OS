@@ -161,11 +161,8 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
         );
         let resp = socket_cmd(&cli.socket, &cmd);
         print!("{resp}");
-
-        // 服务端已释放页，客户端同步清理（幂等释放）
-        region.lock_page_mutex().unwrap();
-        page_alloc.free_pages(start_page, pages_needed);
-        region.unlock_page_mutex().unwrap();
+        // 注意：页由服务端在 cmd_put 中释放，客户端不重复释放，
+        // 否则并发场景下其他客户端可能已重新分配该页，导致竞态损坏。
     } else {
         // 大文件：分块传输
         log_chunked_upload(&cli.socket, &region, &obj_name, &data, content_type, &tags_safe);
@@ -222,17 +219,14 @@ fn log_chunked_upload(
         );
         if !resp.starts_with("OK") {
             eprint!("{resp}");
+            // 服务端报错时未释放页，客户端自行清理
             region.lock_page_mutex().unwrap();
             page_alloc.free_pages(start_page, pages_needed);
             region.unlock_page_mutex().unwrap();
             return;
         }
 
-        // 服务端已读取并释放页，客户端也更新本地跟踪
-        region.lock_page_mutex().unwrap();
-        page_alloc.free_pages(start_page, pages_needed);
-        region.unlock_page_mutex().unwrap();
-
+        // 正常路径：页已由服务端在 cmd_put_chunk 中释放，客户端不重复释放
         offset = chunk_end;
 
         eprint!("\rUploading {name}: {}/{} bytes ({:.0}%)", offset, total_size, offset as f64 / total_size as f64 * 100.0);
