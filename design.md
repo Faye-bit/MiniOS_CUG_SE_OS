@@ -48,33 +48,38 @@ sequenceDiagram
     actor User as 用户
     participant CLI as minios-client
     participant SHM as 共享内存
+    participant MUTEX as pthread_mutex_t
     participant SOCK as Unix Socket
     participant SRV as minios-server
     participant ENG as ObjectStore
     participant ODB as store.odb
 
-    Note over User,ODB: === PUT 操作 ===
+    Note over User,ODB: === PUT 操作 (小文件单次传输) ===
 
     User->>CLI: minios put ./data.bin --name obj1
     CLI->>SHM: shm_open + mmap 打开共享内存
+    CLI->>MUTEX: lock_page_mutex()
     CLI->>SHM: PageAllocator::alloc_pages(N) 申请数据页
     CLI->>SHM: write_to_pages(start, data) 写入对象数据
-    CLI->>SOCK: 发送 PUT 命令 (name, size, pages...)
-    SOCK->>SRV: 接收请求
+    CLI->>MUTEX: unlock_page_mutex()
+    CLI->>SOCK: 发送 "PUT name size type tags start_page num_pages\n"
+    SOCK->>SRV: 接收请求 (每连接一线程)
+    SRV->>MUTEX: lock_page_mutex()
     SRV->>SHM: read_from_pages(start, size) 读取数据
+    SRV->>SHM: PageAllocator::free_pages() 释放页
+    SRV->>MUTEX: unlock_page_mutex()
     SRV->>ENG: store.put(name, data, type, tags)
     ENG->>ODB: Bitmap::allocate_multi(N) 分配数据块
     ENG->>ODB: write_data_block() × N (含 next 指针链表)
-    ENG->>ODB: MetadataEntry::new() + write_metadata_entry()
+    ENG->>ODB: MetadataEntry 写入元数据条目
     ENG->>ODB: Superblock::write_to() 更新超级块
-    SRV->>SHM: PageAllocator::free_pages() 释放页
-    SRV->>SOCK: 返回 UUID
+    SRV->>SOCK: 返回 "OK <uuid>\n"
     SOCK->>CLI: 显示结果
 
     Note over User,ODB: === GET 操作 ===
 
     User->>CLI: minios get <uuid>
-    CLI->>SOCK: 发送 GET 命令 (uuid)
+    CLI->>SOCK: 发送 "GET <uuid>\n"
     SOCK->>SRV: 接收请求
     SRV->>CACHE: LruCache::get(uuid) 查缓存
     alt 缓存命中
@@ -86,9 +91,14 @@ sequenceDiagram
         ENG-->>SRV: 返回完整对象
         SRV->>CACHE: LruCache::put(uuid, data) 更新缓存
     end
+    SRV->>MUTEX: lock_page_mutex()
     SRV->>SHM: alloc_pages + write_to_pages
-    SRV->>SOCK: 返回响应 (pages, size)
+    SRV->>MUTEX: unlock_page_mutex()
+    SRV->>SOCK: 返回 "OK <size> <start_page> <num_pages>\n"
     SOCK->>CLI: 从共享内存读取数据
+    CLI->>MUTEX: lock_page_mutex()
+    CLI->>SHM: read_from_pages() + free_pages()
+    CLI->>MUTEX: unlock_page_mutex()
     CLI-->>User: 输出到 stdout / 文件
 ```
 
@@ -114,11 +124,9 @@ graph TD
     end
 
     CLI_MAIN --> SHM_MOD
-    CLI_MAIN --> PROTOCOL
     SRV_MAIN --> STORAGE
     SRV_MAIN --> SHM_MOD
     SRV_MAIN --> CACHE_MOD
-    SRV_MAIN --> PROTOCOL
     SRV_MAIN --> DAEMON
     STORAGE --> COMMON
     SHM_MOD --> COMMON
@@ -246,6 +254,17 @@ flowchart TD
 
 ### 3.1 区域布局
 
+控制页（Page 0，4096 bytes）布局：
+
+| 区域 | 偏移 | 大小 | 说明 |
+|------|------|------|------|
+| `ShmControlHeader` | 0 | ~32 B | 魔数、版本、页大小、总页数、空闲页数、位图偏移/大小 |
+| Page Bitmap | `page_bitmap_offset` | `ceil(total/8)` B (8 字节对齐) | 页分配位图，1=空闲，0=占用 |
+| `pthread_mutex_t` | 位图之后 (按 `pthread_mutex_t` 对齐) | ~40 B | 跨进程页分配互斥锁 (`PTHREAD_PROCESS_SHARED`) |
+| (保留) | 互斥锁之后 | 剩余空间 | 未使用 |
+
+数据页从 Page 1 开始，共 `total_pages` 页，每页 4096 bytes。
+
 ```mermaid
 block-beta
     columns 1
@@ -255,12 +274,10 @@ block-beta
         p0title["Page 0 — 控制页 (4096 B)"]:1
 
         block:ctrl
-            columns 5
-            header["ShmControlHeader<br/>48 B"]:5
-            pbitmap["Page Bitmap<br/>ceil(total/8) B"]:5
-            req["Request Slots<br/>max_req × 256 B"]:5
-            resp["Response Slots<br/>max_req × 256 B"]:5
-            mutex["pthread_mutex_t<br/>(PTHREAD_PROCESS_SHARED)"]:5
+            columns 3
+            header["ShmControlHeader<br/>~32 B"]:3
+            pbitmap["Page Bitmap<br/>ceil(total/8) B (8B 对齐)"]:3
+            mutex["pthread_mutex_t<br/>(PTHREAD_PROCESS_SHARED)"]:3
         end
     end
 
@@ -297,47 +314,68 @@ flowchart TD
     HAS_MORE -->|"否"| RET_NONE["返回 None<br/>(外部碎片导致分配失败)"]
 ```
 
-### 3.3 客户端-服务端同步机制
+### 3.3 跨进程页分配同步
+
+页分配位图位于共享内存中，服务端和多个客户端可能同时访问。为保证分配/释放的原子性，
+使用位于控制页中的 `pthread_mutex_t`（`PTHREAD_PROCESS_SHARED` 属性）进行跨进程互斥。
+
+**锁的获取模式**：
+
+| 操作 | 客户端 | 服务端 |
+|------|--------|--------|
+| PUT (小文件) | lock → alloc → write → unlock → socket_cmd | lock(state) → lock(page) → read → free → unlock(page) → store.put |
+| PUT (分块) | lock → alloc → write → unlock → socket_cmd (每块) | lock(state) → lock(page) → read → free → unlock(page) → 追加缓冲区 |
+| GET | socket_cmd → lock → read → free → unlock | lock(state) → lock(page) → alloc → write → unlock(page) |
+
+**关键设计：客户端在发送 socket 命令前释放锁。**
+
+客户端不在持有页锁期间等待服务端响应，避免死锁。
+服务端处理请求时先获取 `ServerState` 锁（`Arc<Mutex<>>`），
+再获取页锁——两把锁始终按相同顺序获取：
+
+```
+ServerState 锁 (内部锁) → 页互斥锁 (外部锁)
+```
+
+客户端只持有页锁，不持有 `ServerState` 锁，因此不会发生锁序反转。
+
+**PUT 操作生命周期**：
+1. 客户端：lock → alloc → write → unlock → 发送 socket 命令
+2. 服务端：收到命令 → lock(state) → lock(page) → read → free → unlock(page) → store.put → unlock(state)
+3. 页由服务端释放，客户端不重复释放（避免并发竞态）
+
+**GET 操作生命周期**：
+1. 客户端：发送 socket 命令，收到响应
+2. 服务端：lock(state) → 查缓存/store → lock(page) → alloc → write → unlock(page) → unlock(state) → 返回页号
+3. 客户端：lock → read → free → unlock（客户端释放页）
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant SHM as 共享内存
+    participant C1 as 客户端 A
+    participant C2 as 客户端 B
     participant MUTEX as pthread_mutex_t
-    participant SEM_SRV as sem_server
-    participant SEM_CLI as sem_client
-    participant S as Server
+    participant SHM as 共享内存位图
+    participant S as 服务端
 
-    Note over C,S: === 请求阶段 ===
+    Note over C1,S: 两个客户端并发 PUT
 
-    C->>MUTEX: pthread_mutex_lock()
-    C->>SHM: 查找空闲 Request Slot
-    C->>SHM: 填充请求 (type, uuid, name, pages...)
-    C->>SHM: slot.status = PENDING
-    C->>MUTEX: pthread_mutex_unlock()
-    C->>SEM_SRV: sem_post() 通知服务端
+    C1->>MUTEX: lock() ✓
+    C2->>MUTEX: lock() 阻塞...
 
-    Note over C,S: === 处理阶段 ===
+    C1->>SHM: alloc_pages(2) → pages 0,1
+    C1->>SHM: write_to_pages(0, data_A)
+    C1->>MUTEX: unlock()
 
-    S->>SEM_SRV: sem_wait() 等待请求
-    S->>MUTEX: pthread_mutex_lock()
-    S->>SHM: 扫描 Request Slots
-    S->>SHM: slot.status = PROCESSING
-    S->>MUTEX: pthread_mutex_unlock()
-    S->>S: 处理请求 (Put/Get/Delete...)
+    C2->>MUTEX: lock() ✓
+    C1->>S: socket: PUT name_A ... 0 2
 
-    Note over C,S: === 响应阶段 ===
+    C2->>SHM: alloc_pages(2) → pages 2,3
+    C2->>SHM: write_to_pages(2, data_B)
+    C2->>MUTEX: unlock()
 
-    S->>MUTEX: pthread_mutex_lock()
-    S->>SHM: 填充 Response Slot
-    S->>SHM: req.status = DONE
-    S->>MUTEX: pthread_mutex_unlock()
-    S->>SEM_CLI: sem_post() 通知客户端
-
-    C->>SEM_CLI: sem_wait() 等待响应
-    C->>MUTEX: pthread_mutex_lock()
-    C->>SHM: 读取 Response Slot
-    C->>MUTEX: pthread_mutex_unlock()
+    C2->>S: socket: PUT name_B ... 2 2
+    S->>S: 处理 A: lock(state)→lock(page)→read→free(0,2)→unlock(page)→put→unlock(state)
+    S->>S: 处理 B: lock(state)→lock(page)→read→free(2,2)→unlock(page)→put→unlock(state)
 ```
 
 ---
@@ -415,71 +453,99 @@ flowchart TD
 
 ## 5. 通信协议
 
-### 5.1 消息类型
+系统采用 **双通道** 架构：
+
+- **控制通道**：Unix Domain Socket，文本协议，每次请求一个连接
+- **数据通道**：POSIX 共享内存 (`shm_open`/`mmap`)，传输对象数据
+
+### 5.1 命令格式
+
+所有命令以 `\n` 结尾，服务端返回以 `\n` 结尾的文本响应。
+
+**基础命令**：
+
+| 命令 | 格式 | 响应 | 说明 |
+|------|------|------|------|
+| `PUT` | `PUT <name> <size> <content_type> <tags> <start_page> <num_pages>\n` | `OK <uuid>\n` | 小文件单次上传 |
+| `GET` | `GET <uuid_or_name>\n` | `OK <size> <start_page> <num_pages>\n` | 下载对象 |
+| `DELETE` | `DELETE <uuid>\n` | `OK deleted\n` | 删除对象 |
+| `LIST` | `LIST\n` | `OK <count>\n` + 每行一个对象 | 列出所有对象 |
+| `STATUS` | `STATUS\n` | `OK\n` + 多行统计信息 | 查看服务端状态 |
+| `STOP` | `STOP\n` | `OK shutting down\n` | 停止服务端 |
+
+**错误响应**：以 `ERROR` 开头，后跟描述信息。
+
+### 5.2 分块上传协议
+
+大文件（超过共享内存容量）通过三步协议分块上传：
+
+| 步骤 | 命令 | 说明 |
+|------|------|------|
+| 1. 开始 | `PUT_BEGIN <name> <total_size> <content_type> <tags>\n` | 服务端创建上传缓冲区 (`PendingUpload`) |
+| 2. 循环 | `PUT_CHUNK <name> <chunk_size> <start_page> <num_pages>\n` | 服务端从共享内存读取块，追加到缓冲区，释放页 |
+| 3. 结束 | `PUT_END <name>\n` | 服务端将完整数据写入 `store.odb`，清理缓冲区 |
 
 ```mermaid
-classDiagram
-    class RequestType {
-        <<enumeration>>
-        Put = 0
-        Get = 1
-        Delete = 2
-        List = 3
-        Status = 4
-        Shutdown = 5
-    }
+sequenceDiagram
+    participant CLI as 客户端
+    participant SRV as 服务端
+    participant BUF as PendingUpload 缓冲区
+    participant STORE as ObjectStore
 
-    class ShmRequest {
-        <<256 bytes, #[repr(C)]>>
-        +size: u64
-        +timestamp: i64
-        +client_id: u32
-        +num_pages: u32
-        +start_page: u32
-        +request_type: u8
-        +status: u8
-        +object_id: [u8; 16]
-        +name: [u8; 64]
-        +content_type: [u8; 32]
-        +tags: [u8; 64]
-    }
+    Note over CLI,STORE: 大文件分块上传
 
-    class ResponseStatus {
-        <<enumeration>>
-        Ok = 0
-        NotFound = 1
-        NoSpace = 2
-        Error = 3
-        InvalidRequest = 4
-    }
+    CLI->>SRV: PUT_BEGIN myfile 50000 text/plain {}
+    SRV->>BUF: 创建缓冲区 (capacity=50000)
 
-    class ShmResponse {
-        <<256 bytes, #[repr(C)]>>
-        +size: u64
-        +client_id: u32
-        +num_pages: u32
-        +start_page: u32
-        +list_count: u32
-        +status_code: u8
-        +slot_status: u8
-        +object_id: [u8; 16]
-        +message: [u8; 128]
-    }
+    loop 每块 ≤ 90% 共享内存容量
+        CLI->>CLI: lock→alloc→write→unlock
+        CLI->>SRV: PUT_CHUNK myfile 20000 0 5
+        SRV->>SRV: lock(page)→read→free→unlock(page)
+        SRV->>BUF: 追加 20000 bytes
+        SRV-->>CLI: OK
+    end
 
-    ShmRequest --> RequestType
-    ShmResponse --> ResponseStatus
+    CLI->>SRV: PUT_END myfile
+    SRV->>STORE: store.put(name, full_data, type, tags)
+    SRV->>BUF: 移除缓冲区
+    SRV-->>CLI: OK <uuid>
 ```
 
-### 5.2 槽位状态机
+**设计要点**：
+- 每块最多使用 90% 的共享内存页，保留少量页避免碎片导致的分配失败
+- 正常路径：页由服务端在 `PUT_CHUNK` 中释放，客户端不重复释放
+- 错误路径：服务端返回 ERROR 时未释放页，客户端需自行清理
+- `PUT_END` 之后数据才真正持久化到 `store.odb`
+
+### 5.3 通信模式
 
 ```mermaid
-stateDiagram-v2
-    [*] --> FREE : 初始化
-    FREE --> PENDING : 客户端填充请求
-    PENDING --> PROCESSING : 服务端开始处理
-    PROCESSING --> DONE : 服务端处理完成
-    DONE --> FREE : 客户端读取响应后重置
+flowchart LR
+    subgraph 客户端
+        CMD[构造命令字符串]
+        SEND[UnixStream::connect]
+        WRITE[write_all + flush]
+        READ[read_to_string]
+    end
+
+    subgraph 服务端
+        ACCEPT[accept 连接]
+        SPAWN[thread::spawn]
+        PARSE[解析命令字符串]
+        DISPATCH[dispatch_command]
+        EXEC[执行操作]
+        REPLY[write_all 响应]
+    end
+
+    CMD --> SEND --> WRITE --> READ
+    ACCEPT --> SPAWN --> PARSE --> DISPATCH --> EXEC --> REPLY
+    WRITE -.->|Unix Socket| PARSE
+    REPLY -.->|Unix Socket| READ
 ```
+
+服务端采用 **每连接一线程** 模型：`UnixListener` 设为非阻塞模式，
+主循环以 50ms 间隔轮询 `accept()`，每次 accept 成功后 `thread::spawn` 处理。
+这种模型足够简单，适合课程设计场景。
 
 ---
 
@@ -524,13 +590,14 @@ graph TD
 ## 7. 测试策略
 
 ```mermaid
-pie title 57 个单元测试分布
+pie title 60 个单元测试分布
     "storage/superblock" : 9
     "storage/bitmap" : 10
     "storage/metadata" : 7
     "storage/engine" : 11
     "shm/sync" : 3
     "shm/page" : 8
+    "shm/region" : 3
     "cache/lru" : 9
 ```
 
@@ -542,6 +609,7 @@ pie title 57 个单元测试分布
 | engine | 11 | 创建/打开、Put/Get/Delete/List、大对象跨块、持久化、统计 |
 | shm/sync | 3 | 互斥锁加解锁、信号量 wait/post、try_wait |
 | shm/page | 8 | 单页分配、多页连续、耗尽、碎片、碎片率、边界 |
+| shm/region | 3 | 创建/销毁、写入/读取、打开已存在区域 |
 | cache/lru | 9 | 存/取、未命中、命中率、条目淘汰、内存淘汰、LRU 顺序、失效、预热 |
 
 ### 7.1 手动并发测试注意事项
