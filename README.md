@@ -1,4 +1,4 @@
-# minios — Mini Object Storage
+# Minios — Mini Object Storage
 
 简单对象存储服务，采用扁平化命名空间管理数据。所有对象持久化到单一复合文档文件 `store.odb`，通过 Unix Domain Socket + POSIX 共享内存双通道进行进程间通信。
 
@@ -227,19 +227,29 @@ rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minios.log /tmp
 
 ```bash
 # 启动服务端后，并发上传多个文件
+pids=()
 for i in $(seq 1 10); do
     echo "data-$i" > "/tmp/concurrent_$i.txt" &
+    pids+=($!)
 done
-wait
+for pid in "${pids[@]}"; do
+    wait "$pid"
+done
 
+pids=()
 for i in $(seq 1 10); do
     ./target/release/minios-client put "/tmp/concurrent_$i.txt" --name "concurrent-$i" &
+    pids+=($!)
 done
-wait
+for pid in "${pids[@]}"; do
+    wait "$pid"
+done
 
 # 验证
 ./target/release/minios-client list | grep concurrent
 ```
+
+注意：如果服务端通过 `&` 在当前 shell 后台运行，不要在并发测试中直接使用无参数`wait`。无参数 `wait` 会等待当前 shell 的所有后台任务，包括仍在运行的`minios-server`，因此命令会一直阻塞到服务端退出。上面的写法只等待本轮测试创建的客户端/文件生成进程。
 
 ---
 
