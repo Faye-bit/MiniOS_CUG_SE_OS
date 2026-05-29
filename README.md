@@ -168,6 +168,216 @@ shm_pages_free: 250/256
 
 ---
 
+## 功能演示
+
+以下是一个完整的演示流程，按顺序展示系统所有主要功能。建议在 Ubuntu Linux 上直接复制粘贴运行。
+
+### 0. 环境清理
+
+```bash
+# 清理上次测试的残留文件
+rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minios.log /tmp/minios.sock /tmp/minios.pid
+```
+
+### 1. 启动服务端
+
+```bash
+./target/release/minios-server \
+    --store-path /tmp/test_store.odb \
+    --socket-path /tmp/minios.sock \
+    > /tmp/minios.log 2>&1 &
+
+SERVER_PID=$!
+sleep 1
+echo "Server PID: $SERVER_PID"
+```
+
+### 2. 上传文件
+
+```bash
+# 创建一个测试文件
+echo "Hello, MiniOS! This is a test file." > /tmp/test_file.txt
+
+# 上传文件（对象名默认为文件名）
+./target/release/minios-client put /tmp/test_file.txt
+# => OK <32位十六进制 UUID>
+
+# 指定对象名称和 MIME 类型
+./target/release/minios-client put /tmp/test_file.txt \
+    --name hello-world \
+    --content-type text/plain
+# => OK <UUID>
+```
+
+### 3. 查看对象列表
+
+```bash
+./target/release/minios-client list
+# =>
+# OK 2
+# dffb681b... test_file.txt 37 text/plain 1779982957
+# a64e240a... hello-world    37 text/plain 1779982957
+```
+
+### 4. 下载对象
+
+```bash
+# 按名称下载（输出到 stdout）
+./target/release/minios-client get hello-world
+# => Hello, MiniOS! This is a test file.
+
+# 按 UUID 下载并保存到文件
+UUID=$(./target/release/minios-client list | grep hello-world | awk '{print $1}')
+./target/release/minios-client get "$UUID" --output /tmp/downloaded.txt
+cat /tmp/downloaded.txt
+# => Hello, MiniOS! This is a test file.
+```
+
+### 5. 带标签上传
+
+```bash
+# 上传带自定义标签的文件
+echo '{"author":"Alice","project":"demo"}' > /tmp/meta.json
+./target/release/minios-client put /tmp/meta.json \
+    --name config \
+    --content-type application/json \
+    --tags '{"author":"Alice","project":"demo"}'
+# => OK <UUID>
+```
+
+### 6. 查看服务状态
+
+```bash
+./target/release/minios-client status
+# =>
+# OK
+# store_objects: 3
+# store_blocks_free: 4093/4096
+# store_file_size: 16781312
+# cache_entries: 3/128
+# cache_hit_rate: 0.00
+# shm_pages_free: 256/256
+```
+
+**状态解读**: `store_objects` 显示当前存储的对象数量；`store_blocks_free` 显示剩余数据块；`cache_hit_rate` 表示 LRU 缓存命中率；`shm_pages_free` 显示共享内存空闲页数（256 页全空闲，因为所有请求已完成）。
+
+### 7. 大文件分块上传
+
+```bash
+# 生成 10MB 随机数据文件
+dd if=/dev/urandom of=/tmp/large.bin bs=1M count=10 2>/dev/null
+
+# 上传大文件（自动触发分块传输协议）
+./target/release/minios-client put /tmp/large.bin --name large-test
+# => Uploading large-test: .../10485760 bytes (100%)
+# => OK <UUID>
+```
+
+**工作原理**: 共享内存默认 256 页 x 4KB = 1MB，而文件有 10MB。客户端自动检测文件超过共享内存容量，切换为分块上传协议：`PUT_BEGIN → PUT_CHUNK × N → PUT_END`。每块最多使用 90% 的共享内存页，服务端将块数据累积到 `PendingUpload` 缓冲区，最后一块传输完成后统一写入 `store.odb`。
+
+### 8. 数据持久化验证
+
+```bash
+# 停止服务端
+./target/release/minios-client stop
+wait $SERVER_PID 2>/dev/null
+echo "Server stopped."
+
+# 重新启动服务端（使用同一个 store.odb）
+./target/release/minios-server \
+    --store-path /tmp/test_store.odb \
+    --socket-path /tmp/minios.sock \
+    > /tmp/minios.log 2>&1 &
+SERVER_PID=$!
+sleep 1
+
+# 验证数据仍然存在
+./target/release/minios-client list
+# => OK 4  （hello-world, test_file.txt, config, large-test 均在）
+
+./target/release/minios-client get hello-world
+# => Hello, MiniOS! This is a test file.
+```
+
+### 9. 并发上传
+
+```bash
+# 创建 10 个测试文件
+pids=()
+for i in $(seq 1 10); do
+    echo "concurrent-data-$i" > "/tmp/concurrent_$i.txt" &
+    pids+=($!)
+done
+for pid in "${pids[@]}"; do
+    wait "$pid"
+done
+
+# 同时启动 10 个客户端上传
+echo "=== 并发上传开始 ==="
+pids=()
+for i in $(seq 1 10); do
+    ./target/release/minios-client put "/tmp/concurrent_$i.txt" --name "concurrent-$i" &
+    pids+=($!)
+done
+for pid in "${pids[@]}"; do
+    wait "$pid"
+done
+echo "=== 并发上传完成 ==="
+
+# 验证：所有 10 个对象均已成功持久化
+./target/release/minios-client list | grep concurrent | wc -l
+# => 10
+```
+
+**并发安全机制**: 多个客户端进程通过共享内存传输数据，使用 `pthread_mutex_t`（`PTHREAD_PROCESS_SHARED`）保护页分配位图的并发访问。客户端在持有锁期间完成页分配和数据写入，释放锁后再发送 socket 命令，避免死锁。页由服务端处理请求时释放，客户端不重复释放，防止并发竞态。
+
+### 10. 删除对象
+
+```bash
+# 删除指定对象
+UUID=$(./target/release/minios-client list | grep config | awk '{print $1}')
+./target/release/minios-client delete "$UUID"
+# => OK deleted
+
+# 确认已删除
+./target/release/minios-client list | grep config
+# => (无输出)
+```
+
+### 11. 停止服务
+
+```bash
+# 方式 1：客户端 stop 命令（推荐）
+./target/release/minios-client stop
+# => OK shutting down
+
+# 方式 2：发送信号（stop 命令不可用时）
+kill $SERVER_PID 2>/dev/null
+```
+
+### 12. 守护进程模式（可选）
+
+```bash
+# 以守护进程方式启动
+./target/release/minios-server \
+    --daemon \
+    --pidfile /tmp/minios.pid \
+    --store-path /tmp/test_store.odb
+
+# 通过 PID 文件管理
+cat /tmp/minios.pid       # 查看 PID
+kill $(cat /tmp/minios.pid)  # 停止守护进程
+```
+
+### 清理
+
+```bash
+rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/downloaded.txt \
+      /tmp/meta.json /tmp/concurrent_*.txt /tmp/minios.log /tmp/minios.sock /tmp/minios.pid
+```
+
+---
+
 ## 运行测试
 
 ### 单元测试
