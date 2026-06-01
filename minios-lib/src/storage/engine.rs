@@ -205,11 +205,13 @@ impl ObjectStore {
         self.write_metadata_entry(slot, &entry)?;
         self.metadata_cache[slot] = entry;
 
-        // 5. 更新超级块
+        // 5. 更新超级块并持久化（位图 → 超级块 → fsync）
         self.superblock.total_objects += 1;
         self.superblock.data_area_free_blocks = self.bitmap.free_count();
         self.superblock.touch();
+        self.flush_bitmap()?;
         self.flush_superblock()?;
+        self.file.flush()?;
 
         log::info!("PUT object: name={name}, uuid={uuid:x?}, size={data_len}, blocks={block_count}");
 
@@ -270,11 +272,13 @@ impl ObjectStore {
         let entry_clone = self.metadata_cache[slot].clone();
         self.write_metadata_entry(slot, &entry_clone)?;
 
-        // 更新超级块
+        // 更新超级块并持久化（位图 → 超级块 → fsync）
         self.superblock.total_objects -= 1;
         self.superblock.data_area_free_blocks = self.bitmap.free_count();
         self.superblock.touch();
+        self.flush_bitmap()?;
         self.flush_superblock()?;
+        self.file.flush()?;
 
         log::info!("DELETE object: uuid={uuid:x?}, freed_blocks={}", freed_blocks.len());
 
