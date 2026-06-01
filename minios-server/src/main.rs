@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,7 +73,7 @@ fn main() {
 
     log::info!("minios server starting...");
 
-    let store = if Path::new(&args.store_path).exists() {
+    let mut store = if Path::new(&args.store_path).exists() {
         log::info!("Opening existing store: {}", args.store_path);
         ObjectStore::open(&args.store_path).unwrap_or_else(|e| {
             log::error!("Cannot open store: {e}");
@@ -91,11 +92,27 @@ fn main() {
     };
 
     let cache_memory = args.cache_memory_mb * 1024 * 1024;
-    let cache = LruCache::new(args.cache_capacity, cache_memory);
+    let mut cache = LruCache::new(args.cache_capacity, cache_memory);
     {
         let obj_list = store.list();
+        let ids: Vec<[u8; 16]> = obj_list.iter().map(|o| o.uuid).collect();
+        let limit = args.cache_capacity.min(ids.len());
+        let mut loaded = 0;
+        for id in ids.iter().take(limit) {
+            match store.get_by_id(id) {
+                Ok(Some(obj)) => {
+                    cache.put(obj.summary.uuid, obj.data, obj.summary.name, obj.summary.size);
+                    loaded += 1;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!("Cache warmup: failed to load object {:x?}: {}", id, e);
+                }
+            }
+        }
         log::info!(
-            "Cache warmup: {} objects in store, cache ready (capacity={})",
+            "Cache warmup: loaded {}/{} objects (capacity={})",
+            loaded,
             obj_list.len(),
             args.cache_capacity
         );
@@ -152,6 +169,9 @@ fn main() {
     });
     log::info!("Listening on {}", args.socket_path);
 
+    let active_clients = Arc::new(AtomicU32::new(0));
+    let max_clients = args.max_clients;
+
     listener.set_nonblocking(true).expect("set nonblocking");
 
     loop {
@@ -162,11 +182,21 @@ fn main() {
 
         match listener.accept() {
             Ok((stream, addr)) => {
-                log::debug!("New connection: {:?}", addr);
-                let state = Arc::clone(&state);
-                std::thread::spawn(move || {
-                    handle_client(stream, state);
-                });
+                let current = active_clients.load(Ordering::Relaxed);
+                if current >= max_clients {
+                    log::warn!("Rejecting connection from {:?}: server busy ({}/{})", addr, current, max_clients);
+                    let mut stream = stream;
+                    let _ = stream.write_all(b"ERROR server busy\n");
+                    // stream dropped, closing connection
+                } else {
+                    active_clients.fetch_add(1, Ordering::Relaxed);
+                    let state = Arc::clone(&state);
+                    let active_clients = Arc::clone(&active_clients);
+                    std::thread::spawn(move || {
+                        handle_client(stream, state);
+                        active_clients.fetch_sub(1, Ordering::Relaxed);
+                    });
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
@@ -495,13 +525,14 @@ fn write_get_result(state: &mut ServerState, data: Vec<u8>) -> String {
     let pages_needed = ((data.len() as u64 + 4095) / 4096) as u32;
     // 锁定页互斥锁，保护分配和写入的原子性
     state.region.lock_page_mutex().unwrap();
-    let result = match state.page_alloc.alloc_pages(pages_needed) {
-        Some(start_page) => {
-            state.region.write_to_pages(start_page, &data);
-            format!("OK {} {} {}\n", data.len(), start_page, pages_needed)
-        }
-        None => "ERROR no free shm pages\n".into(),
-    };
+    let region = &state.region;
+    let start_page = state.page_alloc.alloc_pages_wait(
+        pages_needed,
+        || region.unlock_page_mutex().unwrap(),
+        || region.lock_page_mutex().unwrap(),
+    );
+    state.region.write_to_pages(start_page, &data);
+    let result = format!("OK {} {} {}\n", data.len(), start_page, pages_needed);
     state.region.unlock_page_mutex().unwrap();
     result
 }
