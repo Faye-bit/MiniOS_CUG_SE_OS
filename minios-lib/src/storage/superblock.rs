@@ -5,7 +5,7 @@
 //! 文件系统中的超级块设计。
 
 use crate::common::consts;
-use crate::common::error::{miniosError, miniosResult};
+use crate::common::error::{MiniosError, MiniosResult};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -99,13 +99,13 @@ impl Superblock {
     }
 
     /// 从文件读取超级块（文件偏移量 0 处 4096 字节）。
-    pub fn read_from(file: &mut impl Read) -> miniosResult<Self> {
+    pub fn read_from(file: &mut impl Read) -> MiniosResult<Self> {
         let mut buf = [0u8; 4096];
         file.read_exact(&mut buf)?;
 
         // 验证魔数（快速失败，避免在无效文件上反序列化）
         if buf[0..4] != consts::STORE_MAGIC {
-            return Err(miniosError::InvalidStore(
+            return Err(MiniosError::InvalidStore(
                 "magic number mismatch: expected 'MOSB'".into(),
             ));
         }
@@ -114,7 +114,7 @@ impl Superblock {
     }
 
     /// 将超级块写入文件（文件偏移量 0 处 4096 字节）。
-    pub fn write_to(&self, file: &mut (impl Write + Seek)) -> miniosResult<()> {
+    pub fn write_to(&self, file: &mut (impl Write + Seek)) -> MiniosResult<()> {
         file.seek(SeekFrom::Start(0))?;
         let bytes = self.serialize();
         file.write_all(&bytes)?;
@@ -122,30 +122,30 @@ impl Superblock {
     }
 
     /// 验证超级块完整性：魔数、版本、区域一致性检查。
-    pub fn validate(&self) -> miniosResult<()> {
+    pub fn validate(&self) -> MiniosResult<()> {
         if self.magic != consts::STORE_MAGIC {
-            return Err(miniosError::InvalidStore(format!(
+            return Err(MiniosError::InvalidStore(format!(
                 "bad magic: expected {:?}, got {:?}",
                 consts::STORE_MAGIC,
                 self.magic
             )));
         }
         if self.version != consts::STORE_VERSION {
-            return Err(miniosError::InvalidStore(format!(
+            return Err(MiniosError::InvalidStore(format!(
                 "unsupported version: {} (expected {})",
                 self.version,
                 consts::STORE_VERSION
             )));
         }
         if self.block_size != consts::BLOCK_SIZE {
-            return Err(miniosError::InvalidStore(format!(
+            return Err(MiniosError::InvalidStore(format!(
                 "unsupported block size: {} (expected {})",
                 self.block_size,
                 consts::BLOCK_SIZE
             )));
         }
         if self.metadata_entry_size != consts::METADATA_ENTRY_SIZE {
-            return Err(miniosError::InvalidStore(format!(
+            return Err(MiniosError::InvalidStore(format!(
                 "unsupported entry size: {} (expected {})",
                 self.metadata_entry_size,
                 consts::METADATA_ENTRY_SIZE
@@ -155,7 +155,7 @@ impl Superblock {
         // 验证区域偏移量的内部一致性
         let expected_bitmap_offset = self.metadata_area_offset + self.metadata_area_size;
         if self.free_bitmap_offset != expected_bitmap_offset {
-            return Err(miniosError::InvalidStore(format!(
+            return Err(MiniosError::InvalidStore(format!(
                 "bitmap offset mismatch: {} vs expected {}",
                 self.free_bitmap_offset, expected_bitmap_offset
             )));
@@ -163,7 +163,7 @@ impl Superblock {
 
         let expected_data_offset = self.free_bitmap_offset + self.free_bitmap_size;
         if self.data_area_offset != expected_data_offset {
-            return Err(miniosError::InvalidStore(format!(
+            return Err(MiniosError::InvalidStore(format!(
                 "data area offset mismatch: {} vs expected {}",
                 self.data_area_offset, expected_data_offset
             )));

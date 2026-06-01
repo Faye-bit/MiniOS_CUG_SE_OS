@@ -6,7 +6,7 @@
 //! ## 平台要求
 //! 仅在 Linux 上使用，依赖 `PTHREAD_PROCESS_SHARED` 和 `sem_open`。
 
-use crate::common::error::{miniosError, miniosResult};
+use crate::common::error::{MiniosError, MiniosResult};
 use std::ffi::CString;
 
 /// 跨进程互斥锁。
@@ -29,13 +29,13 @@ impl ShmMutex {
     /// # Safety
     /// - `ptr` 必须指向共享内存区域中足够大的有效地址（至少 `sizeof(pthread_mutex_t)` 字节）
     /// - 每个互斥锁只能初始化一次
-    pub unsafe fn init_at(ptr: *mut u8) -> miniosResult<Self> {
+    pub unsafe fn init_at(ptr: *mut u8) -> MiniosResult<Self> {
         let mutex_ptr = ptr as *mut libc::pthread_mutex_t;
 
         let mut attr: libc::pthread_mutexattr_t = unsafe { std::mem::zeroed() };
         let ret = unsafe { libc::pthread_mutexattr_init(&mut attr) };
         if ret != 0 {
-            return Err(miniosError::ShmError(format!(
+            return Err(MiniosError::ShmError(format!(
                 "pthread_mutexattr_init failed: {ret}"
             )));
         }
@@ -45,7 +45,7 @@ impl ShmMutex {
         };
         if ret != 0 {
             unsafe { libc::pthread_mutexattr_destroy(&mut attr) };
-            return Err(miniosError::ShmError(format!(
+            return Err(MiniosError::ShmError(format!(
                 "pthread_mutexattr_setpshared failed: {ret}"
             )));
         }
@@ -53,7 +53,7 @@ impl ShmMutex {
         let ret = unsafe { libc::pthread_mutex_init(mutex_ptr, &attr) };
         unsafe { libc::pthread_mutexattr_destroy(&mut attr) };
         if ret != 0 {
-            return Err(miniosError::ShmError(format!(
+            return Err(MiniosError::ShmError(format!(
                 "pthread_mutex_init failed: {ret}"
             )));
         }
@@ -72,20 +72,20 @@ impl ShmMutex {
     }
 
     /// 锁定互斥锁。
-    pub fn lock(&self) -> miniosResult<()> {
+    pub fn lock(&self) -> MiniosResult<()> {
         let ret = unsafe { libc::pthread_mutex_lock(self.ptr) };
         if ret != 0 {
-            Err(miniosError::ShmError(format!("pthread_mutex_lock failed: {ret}")))
+            Err(MiniosError::ShmError(format!("pthread_mutex_lock failed: {ret}")))
         } else {
             Ok(())
         }
     }
 
     /// 解锁互斥锁。
-    pub fn unlock(&self) -> miniosResult<()> {
+    pub fn unlock(&self) -> MiniosResult<()> {
         let ret = unsafe { libc::pthread_mutex_unlock(self.ptr) };
         if ret != 0 {
-            Err(miniosError::ShmError(format!("pthread_mutex_unlock failed: {ret}")))
+            Err(MiniosError::ShmError(format!("pthread_mutex_unlock failed: {ret}")))
         } else {
             Ok(())
         }
@@ -95,10 +95,10 @@ impl ShmMutex {
     ///
     /// # Safety
     /// 仅在互斥锁不再被任何进程使用时调用。
-    pub unsafe fn destroy(&self) -> miniosResult<()> {
+    pub unsafe fn destroy(&self) -> MiniosResult<()> {
         let ret = unsafe { libc::pthread_mutex_destroy(self.ptr) };
         if ret != 0 {
-            Err(miniosError::ShmError(format!("pthread_mutex_destroy failed: {ret}")))
+            Err(MiniosError::ShmError(format!("pthread_mutex_destroy failed: {ret}")))
         } else {
             Ok(())
         }
@@ -127,9 +127,9 @@ impl ShmSemaphore {
     ///
     /// `name` 是信号量名称（不含 `/` 前缀），例如 `"minios_server_sem"`。
     /// `value` 是初始值。
-    pub fn create(name: &str, value: u32) -> miniosResult<Self> {
+    pub fn create(name: &str, value: u32) -> MiniosResult<Self> {
         let cname = CString::new(name).map_err(|e| {
-            miniosError::ShmError(format!("invalid semaphore name '{name}': {e}"))
+            MiniosError::ShmError(format!("invalid semaphore name '{name}': {e}"))
         })?;
 
         let sem = unsafe {
@@ -154,7 +154,7 @@ impl ShmSemaphore {
                 )
             };
             if sem == libc::SEM_FAILED {
-                return Err(miniosError::ShmError(format!(
+                return Err(MiniosError::ShmError(format!(
                     "sem_open('{name}') failed after unlink: {err}"
                 )));
             }
@@ -165,15 +165,15 @@ impl ShmSemaphore {
     }
 
     /// 打开一个已存在的命名信号量。
-    pub fn open(name: &str) -> miniosResult<Self> {
+    pub fn open(name: &str) -> MiniosResult<Self> {
         let cname = CString::new(name).map_err(|e| {
-            miniosError::ShmError(format!("invalid semaphore name '{name}': {e}"))
+            MiniosError::ShmError(format!("invalid semaphore name '{name}': {e}"))
         })?;
 
         let sem = unsafe { libc::sem_open(cname.as_ptr(), 0) };
         if sem == libc::SEM_FAILED {
             let err = std::io::Error::last_os_error();
-            return Err(miniosError::ShmError(format!(
+            return Err(MiniosError::ShmError(format!(
                 "sem_open('{name}') failed: {err}"
             )));
         }
@@ -183,11 +183,11 @@ impl ShmSemaphore {
 
     /// 等待信号量（P 操作，减 1）。
     /// 如果当前值为 0 则阻塞。
-    pub fn wait(&self) -> miniosResult<()> {
+    pub fn wait(&self) -> MiniosResult<()> {
         let ret = unsafe { libc::sem_wait(self.sem) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            Err(miniosError::ShmError(format!("sem_wait failed: {err}")))
+            Err(MiniosError::ShmError(format!("sem_wait failed: {err}")))
         } else {
             Ok(())
         }
@@ -195,14 +195,14 @@ impl ShmSemaphore {
 
     /// 非阻塞尝试等待信号量。
     /// 如果当前值为 0 则立即返回错误。
-    pub fn try_wait(&self) -> miniosResult<()> {
+    pub fn try_wait(&self) -> MiniosResult<()> {
         let ret = unsafe { libc::sem_trywait(self.sem) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EAGAIN) {
-                Err(miniosError::ShmError("semaphore would block".into()))
+                Err(MiniosError::ShmError("semaphore would block".into()))
             } else {
-                Err(miniosError::ShmError(format!("sem_trywait failed: {err}")))
+                Err(MiniosError::ShmError(format!("sem_trywait failed: {err}")))
             }
         } else {
             Ok(())
@@ -210,22 +210,22 @@ impl ShmSemaphore {
     }
 
     /// 发送信号量（V 操作，加 1）。
-    pub fn post(&self) -> miniosResult<()> {
+    pub fn post(&self) -> MiniosResult<()> {
         let ret = unsafe { libc::sem_post(self.sem) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            Err(miniosError::ShmError(format!("sem_post failed: {err}")))
+            Err(MiniosError::ShmError(format!("sem_post failed: {err}")))
         } else {
             Ok(())
         }
     }
 
     /// 关闭信号量并删除其名称（清理资源）。
-    pub fn close_and_unlink(self) -> miniosResult<()> {
+    pub fn close_and_unlink(self) -> MiniosResult<()> {
         let ret = unsafe { libc::sem_close(self.sem) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            return Err(miniosError::ShmError(format!("sem_close failed: {err}")));
+            return Err(MiniosError::ShmError(format!("sem_close failed: {err}")));
         }
         let ret = unsafe { libc::sem_unlink(self.name.as_ptr()) };
         if ret != 0 {
@@ -237,11 +237,11 @@ impl ShmSemaphore {
     }
 
     /// 只关闭不删除名称（客户端使用）。
-    pub fn close(self) -> miniosResult<()> {
+    pub fn close(self) -> MiniosResult<()> {
         let ret = unsafe { libc::sem_close(self.sem) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            return Err(miniosError::ShmError(format!("sem_close failed: {err}")));
+            return Err(MiniosError::ShmError(format!("sem_close failed: {err}")));
         }
         Ok(())
     }

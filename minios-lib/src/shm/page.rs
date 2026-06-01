@@ -80,10 +80,14 @@ impl PageAllocator {
     /// 调用方在调用此方法时必须已持有页互斥锁。
     /// 当分配失败时，此方法会通过 `unlock`/`lock` 闭包暂时释放互斥锁，
     /// 休眠 10ms 后重新获取锁并重试，直到分配成功。
-    pub fn alloc_pages_wait(&self, count: u32, unlock: impl Fn(), lock: impl Fn()) -> u32 {
+    pub fn alloc_pages_wait(&self, count: u32, unlock: impl Fn(), lock: impl Fn()) -> Option<u32> {
+        if count == 0 || count > self.total_pages {
+            return None;
+        }
+
         loop {
             if let Some(page) = self.alloc_pages(count) {
-                return page;
+                return Some(page);
             }
             unlock();
             std::thread::sleep(std::time::Duration::from_millis(10));

@@ -14,6 +14,7 @@ use minios_lib::shm::region::ShmRegion;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 #[derive(Parser, Debug)]
 #[command(name = "minios", version, about = "minios object storage client")]
@@ -47,6 +48,19 @@ enum Command {
     },
     List,
     Status,
+    /// 启动服务端
+    Start {
+        #[arg(long)]
+        server: Option<PathBuf>,
+        #[arg(long, default_value = consts::DEFAULT_STORE_PATH)]
+        store_path: String,
+        #[arg(long, default_value_t = false)]
+        daemon: bool,
+        #[arg(long, default_value = "/tmp/minios.pid")]
+        pidfile: String,
+        #[arg(long, default_value = "/tmp/minios.log")]
+        log_file: PathBuf,
+    },
     /// 停止服务端
     Stop,
 }
@@ -56,11 +70,80 @@ fn main() {
     match &cli.command {
         Command::Status => cmd_status(&cli),
         Command::List => cmd_list(&cli),
-        Command::Put { file, name, content_type, tags } => cmd_put(&cli, file, name, content_type, tags),
+        Command::Put {
+            file,
+            name,
+            content_type,
+            tags,
+        } => cmd_put(&cli, file, name, content_type, tags),
         Command::Get { id, output } => cmd_get(&cli, id, output),
         Command::Delete { uuid } => cmd_delete(&cli, uuid),
+        Command::Start {
+            server,
+            store_path,
+            daemon,
+            pidfile,
+            log_file,
+        } => {
+            cmd_start(&cli, server, store_path, *daemon, pidfile, log_file)
+        }
         Command::Stop => cmd_stop(&cli),
     }
+}
+
+fn cmd_start(
+    cli: &Cli,
+    server: &Option<PathBuf>,
+    store_path: &str,
+    daemon: bool,
+    pidfile: &str,
+    log_file: &PathBuf,
+) {
+    let server_path = server.clone().unwrap_or_else(default_server_path);
+    let mut cmd = std::process::Command::new(&server_path);
+    cmd.arg("--store-path")
+        .arg(store_path)
+        .arg("--socket-path")
+        .arg(&cli.socket)
+        .arg("--shm-name")
+        .arg(&cli.shm_name)
+        .arg("--pidfile")
+        .arg(pidfile);
+
+    if daemon {
+        cmd.arg("--daemon");
+    } else {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)
+            .unwrap_or_else(|e| {
+                eprintln!("ERROR: cannot open log file '{}': {e}", log_file.display());
+                std::process::exit(1);
+            });
+        let log_err = log.try_clone().unwrap_or_else(|e| {
+            eprintln!("ERROR: cannot clone log file handle: {e}");
+            std::process::exit(1);
+        });
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err));
+    }
+
+    let child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("ERROR: cannot start server '{}': {e}", server_path.display());
+        std::process::exit(1);
+    });
+    println!("OK server started pid={}", child.id());
+}
+
+fn default_server_path() -> PathBuf {
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(dir) = current.parent() {
+            return dir.join("minios-server");
+        }
+    }
+    PathBuf::from("minios-server")
 }
 
 fn cmd_stop(cli: &Cli) {
@@ -127,13 +210,15 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
         }
     };
 
-    if data.is_empty() {
-        eprintln!("ERROR: empty file");
-        std::process::exit(1);
-    }
-
     let total_size = data.len();
     let tags_safe = tags.replace(' ', "_");
+
+    if total_size == 0 {
+        let cmd = format!("PUT {obj_name} 0 {content_type} {tags_safe} 0 0\n");
+        let resp = socket_cmd(&cli.socket, &cmd);
+        print!("{resp}");
+        return;
+    }
 
     let region = open_shm(&cli.shm_name);
     let total_pages = region.header().total_pages;
@@ -147,11 +232,17 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
         region.lock_page_mutex().unwrap();
         let page_alloc = make_page_alloc(&region);
         let pages_needed = ((total_size as u64 + 4095) / 4096) as u32;
-        let start_page = page_alloc.alloc_pages_wait(
-            pages_needed,
-            || region.unlock_page_mutex().unwrap(),
-            || region.lock_page_mutex().unwrap(),
-        );
+        let start_page = page_alloc
+            .alloc_pages_wait(
+                pages_needed,
+                || region.unlock_page_mutex().unwrap(),
+                || region.lock_page_mutex().unwrap(),
+            )
+            .unwrap_or_else(|| {
+                region.unlock_page_mutex().unwrap();
+                eprintln!("ERROR: invalid shared memory request (need {pages_needed} pages)");
+                std::process::exit(1);
+            });
 
         region.write_to_pages(start_page, &data);
         region.unlock_page_mutex().unwrap();
@@ -187,7 +278,10 @@ fn log_chunked_upload(
     let max_chunk_bytes = (total_pages * 9 / 10) * page_size;
 
     // 1. PUT_BEGIN
-    let resp = socket_cmd(socket_path, &format!("PUT_BEGIN {name} {total_size} {content_type} {tags}\n"));
+    let resp = socket_cmd(
+        socket_path,
+        &format!("PUT_BEGIN {name} {total_size} {content_type} {tags}\n"),
+    );
     if !resp.starts_with("OK") {
         eprint!("{resp}");
         return;
@@ -204,11 +298,17 @@ fn log_chunked_upload(
         region.lock_page_mutex().unwrap();
         let page_alloc = make_page_alloc(region);
         let pages_needed = ((chunk_size as u64 + 4095) / 4096) as u32;
-        let start_page = page_alloc.alloc_pages_wait(
-            pages_needed,
-            || region.unlock_page_mutex().unwrap(),
-            || region.lock_page_mutex().unwrap(),
-        );
+        let start_page = page_alloc
+            .alloc_pages_wait(
+                pages_needed,
+                || region.unlock_page_mutex().unwrap(),
+                || region.lock_page_mutex().unwrap(),
+            )
+            .unwrap_or_else(|| {
+                region.unlock_page_mutex().unwrap();
+                eprintln!("ERROR: invalid shared memory request (need {pages_needed} pages)");
+                std::process::exit(1);
+            });
 
         region.write_to_pages(start_page, chunk);
         region.unlock_page_mutex().unwrap();
@@ -229,7 +329,12 @@ fn log_chunked_upload(
         // 正常路径：页已由服务端在 cmd_put_chunk 中释放，客户端不重复释放
         offset = chunk_end;
 
-        eprint!("\rUploading {name}: {}/{} bytes ({:.0}%)", offset, total_size, offset as f64 / total_size as f64 * 100.0);
+        eprint!(
+            "\rUploading {name}: {}/{} bytes ({:.0}%)",
+            offset,
+            total_size,
+            offset as f64 / total_size as f64 * 100.0
+        );
     }
     eprintln!();
 

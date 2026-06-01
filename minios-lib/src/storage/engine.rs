@@ -4,7 +4,7 @@
 //! 内部协调超级块、位图和元数据区的读写。
 
 use crate::common::consts;
-use crate::common::error::{miniosError, miniosResult};
+use crate::common::error::{MiniosError, MiniosResult};
 use crate::common::types::{ObjectData, ObjectId, ObjectSummary, StoreStats};
 use crate::storage::bitmap::BlockBitmap;
 use crate::storage::metadata::{flags, MetadataEntry};
@@ -45,7 +45,7 @@ impl ObjectStore {
         path: impl AsRef<Path>,
         max_objects: u64,
         total_blocks: u64,
-    ) -> miniosResult<Self> {
+    ) -> MiniosResult<Self> {
         let superblock = Superblock::new(max_objects, total_blocks);
         let file_size = superblock.total_file_size();
 
@@ -55,7 +55,7 @@ impl ObjectStore {
             .create_new(true)
             .open(path.as_ref())
             .map_err(|e| {
-                miniosError::Io(std::io::Error::new(
+                MiniosError::Io(std::io::Error::new(
                     e.kind(),
                     format!("cannot create store file '{}': {}", path.as_ref().display(), e),
                 ))
@@ -96,13 +96,13 @@ impl ObjectStore {
     }
 
     /// 打开一个已有的 store.odb 文件。
-    pub fn open(path: impl AsRef<Path>) -> miniosResult<Self> {
+    pub fn open(path: impl AsRef<Path>) -> MiniosResult<Self> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path.as_ref())
             .map_err(|e| {
-                miniosError::Io(std::io::Error::new(
+                MiniosError::Io(std::io::Error::new(
                     e.kind(),
                     format!("cannot open store file '{}': {}", path.as_ref().display(), e),
                 ))
@@ -122,10 +122,16 @@ impl ObjectStore {
         let num_entries = superblock.max_metadata_entries as usize;
         let mut metadata_cache = Vec::with_capacity(num_entries);
         file.seek(SeekFrom::Start(superblock.metadata_area_offset))?;
-        for _ in 0..num_entries {
+        for slot in 0..num_entries {
             let mut entry_buf = [0u8; 256];
             file.read_exact(&mut entry_buf)?;
-            metadata_cache.push(MetadataEntry::from_bytes(&entry_buf));
+            let entry = MetadataEntry::from_bytes(&entry_buf);
+            if entry.is_active() && !entry.verify_checksum() {
+                return Err(MiniosError::InvalidStore(format!(
+                    "metadata checksum mismatch at slot {slot}"
+                )));
+            }
+            metadata_cache.push(entry);
         }
 
         Ok(Self {
@@ -148,7 +154,7 @@ impl ObjectStore {
         data: &[u8],
         content_type: &str,
         tags: &str,
-    ) -> miniosResult<ObjectId> {
+    ) -> MiniosResult<ObjectId> {
         let data_len = data.len() as u64;
         let block_count = if data_len == 0 {
             0
@@ -156,14 +162,19 @@ impl ObjectStore {
             ((data_len as usize) + consts::BLOCK_PAYLOAD - 1) / consts::BLOCK_PAYLOAD
         } as u32;
 
-        // 1. 分配数据块
+        // 1. 查找空闲元数据槽位，避免数据块已分配但无槽位可写。
+        let slot = self
+            .find_free_slot()
+            .ok_or_else(|| MiniosError::NoSpace("no free metadata slots".into()))?;
+
+        // 2. 分配数据块
         let block_indices = if block_count > 0 {
             self.bitmap.allocate_multi(block_count)?
         } else {
             Vec::new()
         };
 
-        // 2. 写入数据块并建立链表
+        // 3. 写入数据块并建立链表
         for (i, &block_idx) in block_indices.iter().enumerate() {
             let start = i * consts::BLOCK_PAYLOAD;
             let end = ((i + 1) * consts::BLOCK_PAYLOAD).min(data.len());
@@ -181,7 +192,7 @@ impl ObjectStore {
 
         let block_ptr_head = block_indices.first().copied().unwrap_or(consts::BLOCK_CHAIN_END);
 
-        // 3. 生成 UUID 和元数据
+        // 4. 生成 UUID 和元数据
         let uuid = *Uuid::new_v4().as_bytes();
         let now = current_timestamp();
         let mut entry = MetadataEntry::new(
@@ -195,17 +206,12 @@ impl ObjectStore {
             now,
         );
 
-        // 4. 查找空闲元数据槽位
-        let slot = self
-            .find_free_slot()
-            .ok_or_else(|| miniosError::NoSpace("no free metadata slots".into()))?;
-
         // 计算校验和后再写入
         entry.update_checksum();
         self.write_metadata_entry(slot, &entry)?;
         self.metadata_cache[slot] = entry;
 
-        // 5. 更新超级块并持久化（位图 → 超级块 → fsync）
+        // 5. 更新超级块并持久化（位图 -> 超级块 -> fsync）
         self.superblock.total_objects += 1;
         self.superblock.data_area_free_blocks = self.bitmap.free_count();
         self.superblock.touch();
@@ -219,7 +225,7 @@ impl ObjectStore {
     }
 
     /// 通过 UUID 获取对象数据。返回 `None` 表示未找到。
-    pub fn get_by_id(&mut self, uuid: &ObjectId) -> miniosResult<Option<ObjectData>> {
+    pub fn get_by_id(&mut self, uuid: &ObjectId) -> MiniosResult<Option<ObjectData>> {
         let slot = match self.find_by_uuid(uuid) {
             Some(s) => s,
             None => return Ok(None),
@@ -235,7 +241,7 @@ impl ObjectStore {
     }
 
     /// 通过名称获取对象数据。返回 `None` 表示未找到。
-    pub fn get_by_name(&mut self, name: &str) -> miniosResult<Option<ObjectData>> {
+    pub fn get_by_name(&mut self, name: &str) -> MiniosResult<Option<ObjectData>> {
         let slot = match self.find_by_name(name) {
             Some(s) => s,
             None => return Ok(None),
@@ -250,7 +256,7 @@ impl ObjectStore {
     }
 
     /// 通过 UUID 删除对象。返回 `Ok(true)` 表示已删除，`Ok(false)` 表示未找到。
-    pub fn delete(&mut self, uuid: &ObjectId) -> miniosResult<bool> {
+    pub fn delete(&mut self, uuid: &ObjectId) -> MiniosResult<bool> {
         let slot = match self.find_by_uuid(uuid) {
             Some(s) => s,
             None => return Ok(false),
@@ -269,10 +275,11 @@ impl ObjectStore {
 
         // 标记元数据槽位为 tombstone 并写回
         self.metadata_cache[slot].flags = flags::TOMBSTONE;
+        self.metadata_cache[slot].update_checksum();
         let entry_clone = self.metadata_cache[slot].clone();
         self.write_metadata_entry(slot, &entry_clone)?;
 
-        // 更新超级块并持久化（位图 → 超级块 → fsync）
+        // 更新超级块并持久化（位图 -> 超级块 -> fsync）
         self.superblock.total_objects -= 1;
         self.superblock.data_area_free_blocks = self.bitmap.free_count();
         self.superblock.touch();
@@ -316,7 +323,7 @@ impl ObjectStore {
     }
 
     /// 将超级块和位图持久化到磁盘。
-    pub fn flush(&mut self) -> miniosResult<()> {
+    pub fn flush(&mut self) -> MiniosResult<()> {
         self.flush_superblock()?;
         self.flush_bitmap()?;
         self.file.flush()?;
@@ -361,7 +368,7 @@ impl ObjectStore {
     }
 
     /// 沿着块链读取并拼接数据。
-    fn read_block_chain(&mut self, head: u64, size: u64) -> miniosResult<Vec<u8>> {
+    fn read_block_chain(&mut self, head: u64, size: u64) -> MiniosResult<Vec<u8>> {
         let mut data = Vec::with_capacity(size as usize);
 
         let mut block_idx = head;
@@ -378,7 +385,7 @@ impl ObjectStore {
 
     /// 从元数据条目读取完整对象数据（已弃用，保留以备用）。
     #[allow(dead_code)]
-    fn read_object_from_entry(&mut self, entry: &MetadataEntry) -> miniosResult<ObjectData> {
+    fn read_object_from_entry(&mut self, entry: &MetadataEntry) -> MiniosResult<ObjectData> {
         let data = self.read_block_chain(entry.block_ptr_head, entry.size)?;
         Ok(ObjectData {
             summary: ObjectSummary {
@@ -405,7 +412,7 @@ impl ObjectStore {
         block_idx: u64,
         payload: &[u8],
         next: u64,
-    ) -> miniosResult<()> {
+    ) -> MiniosResult<()> {
         assert!(
             payload.len() <= consts::BLOCK_PAYLOAD,
             "payload too large: {} > {}",
@@ -430,7 +437,7 @@ impl ObjectStore {
     }
 
     /// 读取一个数据块，返回 (payload 字节, next 指针)。
-    fn read_data_block(&mut self, block_idx: u64) -> miniosResult<(Vec<u8>, u64)> {
+    fn read_data_block(&mut self, block_idx: u64) -> MiniosResult<(Vec<u8>, u64)> {
         let offset = self.block_offset(block_idx);
         self.file.seek(SeekFrom::Start(offset))?;
 
@@ -445,7 +452,7 @@ impl ObjectStore {
     }
 
     /// 将元数据条目写回文件槽位。
-    fn write_metadata_entry(&mut self, slot: usize, entry: &MetadataEntry) -> miniosResult<()> {
+    fn write_metadata_entry(&mut self, slot: usize, entry: &MetadataEntry) -> MiniosResult<()> {
         let offset = self.superblock.metadata_area_offset + slot as u64 * consts::METADATA_ENTRY_SIZE;
         self.file.seek(SeekFrom::Start(offset))?;
         let bytes = entry.to_bytes();
@@ -454,12 +461,12 @@ impl ObjectStore {
     }
 
     /// 持久化超级块。
-    fn flush_superblock(&mut self) -> miniosResult<()> {
+    fn flush_superblock(&mut self) -> MiniosResult<()> {
         self.superblock.write_to(&mut self.file)
     }
 
     /// 持久化位图。
-    fn flush_bitmap(&mut self) -> miniosResult<()> {
+    fn flush_bitmap(&mut self) -> MiniosResult<()> {
         let bytes = self.bitmap.to_bytes();
         self.file
             .seek(SeekFrom::Start(self.superblock.free_bitmap_offset))?;
@@ -679,6 +686,25 @@ mod tests {
         assert_eq!(store2.list().len(), 2);
         assert!(store2.get_by_name("a.txt").unwrap().is_some());
         assert!(store2.get_by_name("b.txt").unwrap().is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_open_rejects_bad_metadata_checksum() {
+        let path = temp_store_path("bad_checksum");
+        let mut store = create_test_store(&path);
+        store.put("bad.txt", b"checksum", "text/plain", "").unwrap();
+        store.flush().unwrap();
+        drop(store);
+
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(consts::BLOCK_SIZE + 80)).unwrap();
+        file.write_all(&999u64.to_le_bytes()).unwrap();
+        drop(file);
+
+        let result = ObjectStore::open(&path);
+        assert!(result.is_err());
 
         let _ = std::fs::remove_file(&path);
     }

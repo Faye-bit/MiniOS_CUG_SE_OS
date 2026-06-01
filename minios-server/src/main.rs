@@ -182,21 +182,25 @@ fn main() {
 
         match listener.accept() {
             Ok((stream, addr)) => {
-                let current = active_clients.load(Ordering::Relaxed);
-                if current >= max_clients {
+                let accepted = active_clients
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                        (current < max_clients).then_some(current + 1)
+                    })
+                    .is_ok();
+                if !accepted {
+                    let current = active_clients.load(Ordering::SeqCst);
                     log::warn!("Rejecting connection from {:?}: server busy ({}/{})", addr, current, max_clients);
                     let mut stream = stream;
                     let _ = stream.write_all(b"ERROR server busy\n");
-                    // stream dropped, closing connection
-                } else {
-                    active_clients.fetch_add(1, Ordering::Relaxed);
-                    let state = Arc::clone(&state);
-                    let active_clients = Arc::clone(&active_clients);
-                    std::thread::spawn(move || {
-                        handle_client(stream, state);
-                        active_clients.fetch_sub(1, Ordering::Relaxed);
-                    });
+                    continue;
                 }
+
+                let state = Arc::clone(&state);
+                let active_clients = Arc::clone(&active_clients);
+                std::thread::spawn(move || {
+                    handle_client(stream, state);
+                    active_clients.fetch_sub(1, Ordering::SeqCst);
+                });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
@@ -526,13 +530,17 @@ fn write_get_result(state: &mut ServerState, data: Vec<u8>) -> String {
     // 锁定页互斥锁，保护分配和写入的原子性
     state.region.lock_page_mutex().unwrap();
     let region = &state.region;
-    let start_page = state.page_alloc.alloc_pages_wait(
+    let result = match state.page_alloc.alloc_pages_wait(
         pages_needed,
         || region.unlock_page_mutex().unwrap(),
         || region.lock_page_mutex().unwrap(),
-    );
-    state.region.write_to_pages(start_page, &data);
-    let result = format!("OK {} {} {}\n", data.len(), start_page, pages_needed);
+    ) {
+        Some(start_page) => {
+            state.region.write_to_pages(start_page, &data);
+            format!("OK {} {} {}\n", data.len(), start_page, pages_needed)
+        }
+        None => "ERROR object too large for shared memory response\n".into(),
+    };
     state.region.unlock_page_mutex().unwrap();
     result
 }
