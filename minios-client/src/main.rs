@@ -147,11 +147,11 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
         region.lock_page_mutex().unwrap();
         let page_alloc = make_page_alloc(&region);
         let pages_needed = ((total_size as u64 + 4095) / 4096) as u32;
-        let start_page = page_alloc.alloc_pages(pages_needed).unwrap_or_else(|| {
-            region.unlock_page_mutex().unwrap();
-            eprintln!("ERROR: not enough shared memory pages (need {pages_needed})");
-            std::process::exit(1);
-        });
+        let start_page = page_alloc.alloc_pages_wait(
+            pages_needed,
+            || region.unlock_page_mutex().unwrap(),
+            || region.lock_page_mutex().unwrap(),
+        );
 
         region.write_to_pages(start_page, &data);
         region.unlock_page_mutex().unwrap();
@@ -204,11 +204,11 @@ fn log_chunked_upload(
         region.lock_page_mutex().unwrap();
         let page_alloc = make_page_alloc(region);
         let pages_needed = ((chunk_size as u64 + 4095) / 4096) as u32;
-        let start_page = page_alloc.alloc_pages(pages_needed).unwrap_or_else(|| {
-            region.unlock_page_mutex().unwrap();
-            eprintln!("ERROR: not enough shm pages for chunk (need {pages_needed})");
-            std::process::exit(1);
-        });
+        let start_page = page_alloc.alloc_pages_wait(
+            pages_needed,
+            || region.unlock_page_mutex().unwrap(),
+            || region.lock_page_mutex().unwrap(),
+        );
 
         region.write_to_pages(start_page, chunk);
         region.unlock_page_mutex().unwrap();

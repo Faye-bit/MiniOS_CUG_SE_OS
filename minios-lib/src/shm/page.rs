@@ -75,6 +75,22 @@ impl PageAllocator {
         None
     }
 
+    /// 分配 `count` 个连续空闲页，如果当前无足够连续空闲页则等待。
+    ///
+    /// 调用方在调用此方法时必须已持有页互斥锁。
+    /// 当分配失败时，此方法会通过 `unlock`/`lock` 闭包暂时释放互斥锁，
+    /// 休眠 10ms 后重新获取锁并重试，直到分配成功。
+    pub fn alloc_pages_wait(&self, count: u32, unlock: impl Fn(), lock: impl Fn()) -> u32 {
+        loop {
+            if let Some(page) = self.alloc_pages(count) {
+                return page;
+            }
+            unlock();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            lock();
+        }
+    }
+
     /// 释放从 `start_page` 开始的 `count` 个连续页。
     pub fn free_pages(&self, start_page: u32, count: u32) {
         for i in 0..count {
