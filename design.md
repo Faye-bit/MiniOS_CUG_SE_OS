@@ -475,6 +475,11 @@ flowchart TD
 
 **错误响应**：以 `ERROR` 开头，后跟描述信息。
 
+当前实现为了保持课程设计演示简单，控制通道采用空格分隔的文本协议；对象名、`content_type`
+和 `tags` 不应包含空格，客户端会将 `tags` 中的空格替换为 `_`。`protocol/request.rs` 和
+`protocol/response.rs` 中保留了共享内存请求/响应槽位结构，作为后续改为纯共享内存队列协议
+时的扩展基础；当前主流程以 Unix Domain Socket 文本控制消息为准。
+
 ### 5.2 分块上传协议
 
 大文件（超过共享内存容量）通过三步协议分块上传：
@@ -590,11 +595,11 @@ graph TD
 ## 7. 测试策略
 
 ```mermaid
-pie title 60 个单元测试分布
+pie title 61 个单元测试分布
     "storage/superblock" : 9
     "storage/bitmap" : 10
     "storage/metadata" : 7
-    "storage/engine" : 11
+    "storage/engine" : 12
     "shm/sync" : 3
     "shm/page" : 8
     "shm/region" : 3
@@ -606,11 +611,13 @@ pie title 60 个单元测试分布
 | superblock | 9 | 创建、序列化往返、魔数/版本校验、文件读写、时间戳 |
 | bitmap | 10 | 单块分配、多块分配、耗尽、释放、幂等释放、序列化 |
 | metadata | 7 | 空闲条目、活跃条目、校验和、序列化、中文名、截断 |
-| engine | 11 | 创建/打开、Put/Get/Delete/List、大对象跨块、持久化、统计 |
+| engine | 12 | 创建/打开、Put/Get/Delete/List、大对象跨块、持久化、统计、元数据校验和损坏检测 |
 | shm/sync | 3 | 互斥锁加解锁、信号量 wait/post、try_wait |
 | shm/page | 8 | 单页分配、多页连续、耗尽、碎片、碎片率、边界 |
 | shm/region | 3 | 创建/销毁、写入/读取、打开已存在区域 |
 | cache/lru | 9 | 存/取、未命中、命中率、条目淘汰、内存淘汰、LRU 顺序、失效、预热 |
+
+注：`shm/region` 的 3 个测试仅在 Linux 目标上启用；在 macOS 本机运行时通常显示 58 个测试通过。
 
 ### 7.1 手动并发测试注意事项
 

@@ -117,6 +117,16 @@ minios put ./photo.jpg --name avatar --content-type image/jpeg --tags '{"user":"
 minios --socket /tmp/minios.sock put ./file.bin
 ```
 
+### 启动服务
+
+```bash
+# 默认启动同目录下的 minios-server，并将日志写入 /tmp/minios.log
+minios start --store-path /tmp/test_store.odb
+
+# 指定服务端程序路径
+minios start --server ./target/release/minios-server --store-path /tmp/test_store.odb
+```
+
 ### 下载对象
 
 ```bash
@@ -364,6 +374,11 @@ kill $SERVER_PID 2>/dev/null
     --pidfile /tmp/minios.pid \
     --store-path /tmp/test_store.odb
 
+# 也可以通过客户端启动服务端（默认查找同目录下的 minios-server）
+./target/release/minios-client start \
+    --store-path /tmp/test_store.odb \
+    --log-file /tmp/minios.log
+
 # 通过 PID 文件管理
 cat /tmp/minios.pid       # 查看 PID
 kill $(cat /tmp/minios.pid)  # 停止守护进程
@@ -387,7 +402,7 @@ rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/downloaded.txt 
 cargo test
 
 # 运行特定模块
-cargo test -p minios-lib --lib storage::       # 存储引擎 (37 个)
+cargo test -p minios-lib --lib storage::       # 存储引擎 (38 个)
 cargo test -p minios-lib --lib shm::           # 共享内存 (11 个，部分需 Linux)
 cargo test -p minios-lib --lib cache::         # LRU 缓存 (9 个)
 
