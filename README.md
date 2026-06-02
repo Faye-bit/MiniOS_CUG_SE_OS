@@ -31,7 +31,7 @@ cargo build --release
 
 ## 运行服务端
 
-### 前台模式（调试用）
+### 前台模式
 
 ```bash
 ./target/release/minios-server \
@@ -45,7 +45,7 @@ cargo build --release
     --total-blocks 4096
 ```
 
-### 后台模式（集成测试用）
+### 后台模式
 
 ```bash
 # 重定向输出，避免干扰终端
@@ -178,7 +178,7 @@ shm_pages_free: 250/256
 
 ---
 
-## 功能演示
+## 功能演示（集成测试）
 
 以下是一个完整的演示流程，按顺序展示系统所有主要功能。建议在 Ubuntu Linux 上直接复制粘贴运行。
 
@@ -193,14 +193,16 @@ rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minios.log /tmp
 
 ```bash
 ./target/release/minios-server \
-    --store-path /tmp/test_store.odb \
+    --store-path ./store.odb \
     --socket-path /tmp/minios.sock \
-    > /tmp/minios.log 2>&1 &
-
-SERVER_PID=$!
-sleep 1
-echo "Server PID: $SERVER_PID"
+    --shm-name /minios_shm \
+    --shm-pages 256 \
+    --cache-capacity 128 \
+    --cache-memory-mb 64 \
+    --max-objects 1024 \
+    --total-blocks 4096
 ```
+服务器启动后，当前终端将持续等待并响应客户端的操作，所以接下来请另开一个终端执行下列流程。
 
 ### 2. 上传文件
 
@@ -288,22 +290,21 @@ dd if=/dev/urandom of=/tmp/large.bin bs=1M count=10 2>/dev/null
 ### 8. 数据持久化验证
 
 ```bash
+./target/release/minios-client list
+# => OK <N>  
+
 # 停止服务端
 ./target/release/minios-client stop
 wait $SERVER_PID 2>/dev/null
 echo "Server stopped."
 
-# 重新启动服务端（使用同一个 store.odb）
-./target/release/minios-server \
-    --store-path /tmp/test_store.odb \
-    --socket-path /tmp/minios.sock \
-    > /tmp/minios.log 2>&1 &
-SERVER_PID=$!
-sleep 1
+# 重新启动服务端（默认查找同目录下的 minios-server）
+./target/release/minios-client start
+# => OK server started pid = <PID>
 
 # 验证数据仍然存在
 ./target/release/minios-client list
-# => OK 4  （hello-world, test_file.txt, config, large-test 均在）
+# => OK <N>
 
 ./target/release/minios-client get hello-world
 # => Hello, MiniOS! This is a test file.
@@ -374,11 +375,6 @@ kill $SERVER_PID 2>/dev/null
     --pidfile /tmp/minios.pid \
     --store-path /tmp/test_store.odb
 
-# 也可以通过客户端启动服务端（默认查找同目录下的 minios-server）
-./target/release/minios-client start \
-    --store-path /tmp/test_store.odb \
-    --log-file /tmp/minios.log
-
 # 通过 PID 文件管理
 cat /tmp/minios.pid       # 查看 PID
 kill $(cat /tmp/minios.pid)  # 停止守护进程
@@ -393,9 +389,7 @@ rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/downloaded.txt 
 
 ---
 
-## 运行测试
-
-### 单元测试
+## 单元测试
 
 ```bash
 # 运行所有测试
@@ -412,69 +406,6 @@ cargo test -- --nocapture
 # 运行单个测试
 cargo test -p minios-lib --lib storage::engine::tests::test_put_large_object_spans_blocks
 ```
-
-### 集成测试（手动）
-
-```bash
-# 0. 清理残留
-rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minios.sock
-
-# 1. 启动服务端（后台 + 重定向日志）
-./target/release/minios-server --store-path /tmp/test_store.odb > /tmp/minios.log 2>&1 &
-SERVER_PID=$!
-sleep 1
-
-# 2. 基本操作流程
-echo "Hello, MiniOS!" > /tmp/test_file.txt
-./target/release/minios-client put /tmp/test_file.txt --name hello
-./target/release/minios-client list
-./target/release/minios-client get hello
-./target/release/minios-client status
-
-# 3. 大对象测试（10MB，自动分块传输）
-dd if=/dev/urandom of=/tmp/large.bin bs=1M count=10 2>/dev/null
-./target/release/minios-client put /tmp/large.bin --name large-test
-
-# 4. 重启持久化测试
-kill $SERVER_PID && wait $SERVER_PID
-./target/release/minios-server --store-path /tmp/test_store.odb > /tmp/minios.log 2>&1 &
-SERVER_PID=$!
-sleep 1
-./target/release/minios-client list   # 应显示之前的对象
-./target/release/minios-client get hello
-
-# 5. 清理
-./target/release/minios-client stop 2>/dev/null || kill $SERVER_PID 2>/dev/null
-rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minios.log /tmp/minios.sock
-```
-
-### 并发测试
-
-```bash
-# 启动服务端后，并发上传多个文件
-pids=()
-for i in $(seq 1 10); do
-    echo "data-$i" > "/tmp/concurrent_$i.txt" &
-    pids+=($!)
-done
-for pid in "${pids[@]}"; do
-    wait "$pid"
-done
-
-pids=()
-for i in $(seq 1 10); do
-    ./target/release/minios-client put "/tmp/concurrent_$i.txt" --name "concurrent-$i" &
-    pids+=($!)
-done
-for pid in "${pids[@]}"; do
-    wait "$pid"
-done
-
-# 验证
-./target/release/minios-client list | grep concurrent
-```
-
-注意：如果服务端通过 `&` 在当前 shell 后台运行，不要在并发测试中直接使用无参数`wait`。无参数 `wait` 会等待当前 shell 的所有后台任务，包括仍在运行的`minios-server`，因此命令会一直阻塞到服务端退出。上面的写法只等待本轮测试创建的客户端/文件生成进程。
 
 ---
 
