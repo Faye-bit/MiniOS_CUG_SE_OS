@@ -13,6 +13,8 @@ struct CacheEntry {
     data: Vec<u8>,
     /// 对象大小（用于内存统计）
     size: u64,
+    /// 对象名称（用于支持按名称查询缓存）
+    name: String,
 }
 
 /// LRU 对象缓存。
@@ -28,6 +30,8 @@ pub struct LruCache {
     current_memory: u64,
     /// UUID → 缓存条目
     map: HashMap<ObjectId, CacheEntry>,
+    /// 名称 → UUID 索引（用于支持按名称 O(1) 查询缓存）
+    name_index: HashMap<String, ObjectId>,
     /// 访问顺序（最近使用在尾部）
     order: VecDeque<ObjectId>,
     /// 命中次数
@@ -49,6 +53,7 @@ impl LruCache {
             max_memory,
             current_memory: 0,
             map: HashMap::with_capacity(capacity.min(1024)),
+            name_index: HashMap::with_capacity(capacity.min(1024)),
             order: VecDeque::with_capacity(capacity.min(1024)),
             hits: 0,
             misses: 0,
@@ -71,16 +76,38 @@ impl LruCache {
         }
     }
 
+    /// 按名称查找对象，更新访问顺序和命中/未命中计数。
+    ///
+    /// 先通过名称索引找到 UUID，再通过 `get()` 查找数据，
+    /// 确保命中/未命中计数与 UUID 查找保持统一。
+    /// 返回 `None` 表示缓存未命中（调用方应从存储引擎加载）。
+    pub fn get_by_name(&mut self, name: &str) -> Option<&[u8]> {
+        if let Some(&uuid) = self.name_index.get(name) {
+            // 通过 UUID 查找，命中/未命中由 get() 统一统计
+            self.get(&uuid)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
     /// 将对象放入缓存。如果缓存满则淘汰 LRU 条目。
     ///
-    /// 如果对象已存在于缓存中，先移除旧条目再插入。
-    pub fn put(&mut self, id: ObjectId, data: Vec<u8>, _name: String, size: u64) {
+    /// 如果对象已存在于缓存中（同 UUID 或同名称），先移除旧条目再插入。
+    pub fn put(&mut self, id: ObjectId, data: Vec<u8>, name: String, size: u64) {
         // 先检查 size 是否超过容量限制，如果是则不缓存
         if size > self.max_memory {
             return;
         }
 
-        // 如果已存在，先移除旧条目
+        // 如果另一条目使用了相同的名称，先移除它
+        if let Some(&old_id) = self.name_index.get(&name) {
+            if old_id != id {
+                self.remove_entry(&old_id);
+            }
+        }
+
+        // 如果同 UUID 已存在，先移除旧条目
         if self.map.contains_key(&id) {
             self.remove_entry(&id);
         }
@@ -96,7 +123,8 @@ impl LruCache {
         }
 
         self.current_memory += size;
-        self.map.insert(id, CacheEntry { data, size });
+        self.map.insert(id, CacheEntry { data, size, name: name.clone() });
+        self.name_index.insert(name, id);
         self.order.push_back(id);
     }
 
@@ -162,6 +190,7 @@ impl LruCache {
     fn remove_entry(&mut self, id: &ObjectId) {
         if let Some(entry) = self.map.remove(id) {
             self.current_memory = self.current_memory.saturating_sub(entry.size);
+            self.name_index.remove(&entry.name);
             self.order.retain(|x| x != id);
         }
     }
@@ -169,8 +198,8 @@ impl LruCache {
     /// 淘汰队首（最久未使用）条目。
     fn evict_one(&mut self) -> bool {
         if let Some(id) = self.order.pop_front() {
-            if let Some(entry) = self.map.remove(&id) {
-                self.current_memory = self.current_memory.saturating_sub(entry.size);
+            if self.map.contains_key(&id) {
+                self.remove_entry(&id);
                 self.evictions += 1;
                 return true;
             }
@@ -222,6 +251,44 @@ mod tests {
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 1);
         assert!((stats.hit_rate - 2.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_get_by_name_hit_and_miss() {
+        let mut cache = LruCache::new(10, 1024 * 1024);
+        let (id, data) = make_obj(1, 50);
+        cache.put(id, data.clone(), "photo.png".into(), 50);
+
+        // 按名称命中
+        assert_eq!(cache.get_by_name("photo.png"), Some(data.as_slice()));
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 0);
+
+        // 按名称未命中（不存在该名称）
+        assert!(cache.get_by_name("nonexistent.png").is_none());
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 1);
+
+        // 确认 hit_rate 被正确更新
+        let stats = cache.stats();
+        assert!((stats.hit_rate - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_get_by_name_name_conflict() {
+        let mut cache = LruCache::new(10, 1024 * 1024);
+        let (id1, d1) = make_obj(1, 50);
+        let (id2, d2) = make_obj(2, 50);
+
+        // 同名称不同 UUID，第二次 put 应移除第一次的条目
+        cache.put(id1, d1, "same_name".into(), 50);
+        cache.put(id2, d2.clone(), "same_name".into(), 50);
+
+        // 按名称查找应返回第二次 put 的数据
+        assert_eq!(cache.get_by_name("same_name"), Some(d2.as_slice()));
+        // 旧 UUID 应不存在
+        assert!(cache.get(&id1).is_none());
+        assert_eq!(cache.stats().size, 1);
     }
 
     #[test]
