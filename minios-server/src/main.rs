@@ -826,6 +826,9 @@ fn cmd_status(state: &SharedState) -> String {
          store_blocks_free: {}/{}\n\
          store_file_size: {}\n\
          cache_entries: {}/{}\n\
+         cache_hits: {}\n\
+         cache_misses: {}\n\
+         cache_evictions: {}\n\
          cache_hit_rate: {:.2}\n\
          shm_pages_free: {}/{}\n",
         stats.total_objects,
@@ -834,6 +837,9 @@ fn cmd_status(state: &SharedState) -> String {
         stats.file_size,
         cache_stats.size,
         cache_stats.capacity,
+        cache_stats.hits,
+        cache_stats.misses,
+        cache_stats.evictions,
         cache_stats.hit_rate,
         header.free_pages,
         header.total_pages,

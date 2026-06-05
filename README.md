@@ -167,11 +167,14 @@ minios status
 
 输出示例：
 ```
-STATUS OK
+OK
 store_objects: 42
 store_blocks_free: 3500/4096
 store_file_size: 16777216
 cache_entries: 42/128
+cache_hits: 87
+cache_misses: 13
+cache_evictions: 0
 cache_hit_rate: 0.87
 shm_pages_free: 250/256
 ```
@@ -424,7 +427,9 @@ sleep 1
 # OK
 # ...
 # cache_entries: 4/4          ← 缓存已满（预热了 4 个对象）
-# cache_hit_rate: 0.00        ← 尚未发生任何 GET 查询
+# cache_hits: 0               ← 尚未发生任何 GET 查询
+# cache_misses: 0
+# cache_hit_rate: 0.00
 # ...
 ```
 
@@ -439,7 +444,9 @@ sleep 1
 
 ./target/release/minios-client status
 # =>
-# cache_hit_rate: 1.00        ← 1 hit / 1 query = 100%
+# cache_hits: 1               ← 1 命中
+# cache_misses: 0
+# cache_hit_rate: 1.00        ← 1/1 = 100%
 ```
 
 **9.3 未命中——触发磁盘读取**
@@ -452,7 +459,9 @@ sleep 1
 
 ./target/release/minios-client status
 # =>
-# cache_hit_rate: 0.50        ← 1 hit + 1 miss → 1/2 = 50%
+# cache_hits: 1               ← 仍是 1 命中
+# cache_misses: 1             ← 新增 1 未命中
+# cache_hit_rate: 0.50        ← 1/2 = 50%
 ```
 
 > **发生了什么？** 服务端执行了完整的"缓存未命中"路径：
@@ -470,7 +479,9 @@ sleep 1
 
 ./target/release/minios-client status
 # =>
-# cache_hit_rate: 0.67        ← 2 hits + 1 miss → 2/3 ≈ 67%
+# cache_hits: 2               ← 命中 +1
+# cache_misses: 1             ← 未命中不变
+# cache_hit_rate: 0.67        ← 2/3 ≈ 67%
 ```
 
 **命中率趋势解读**：
@@ -494,7 +505,9 @@ GET concurrent-1   (命中)      2     1       0.67   ← 回升到 67%
 # 命中率继续下降
 ./target/release/minios-client status
 # =>
-# cache_hit_rate: 0.50        ← 2 hits + 2 misses → 2/4 = 50%
+# cache_hits: 2               ← 命中不变
+# cache_misses: 2             ← 未命中 +1
+# cache_hit_rate: 0.50        ← 2/4 = 50%
 
 # 再次访问 → 又命中
 ./target/release/minios-client get concurrent-5
@@ -502,7 +515,9 @@ GET concurrent-1   (命中)      2     1       0.67   ← 回升到 67%
 
 ./target/release/minios-client status
 # =>
-# cache_hit_rate: 0.60        ← 3 hits + 2 misses → 3/5 = 60%
+# cache_hits: 3               ← 命中 +1
+# cache_misses: 2             ← 未命中不变
+# cache_hit_rate: 0.60        ← 3/5 = 60%
 ```
 
 **9.6 恢复默认配置**
