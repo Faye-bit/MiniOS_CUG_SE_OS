@@ -21,7 +21,7 @@ use minios_lib::storage::engine::ObjectStore;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -140,6 +140,19 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
+    // ── 将相对路径转为绝对路径（在 daemonize 之前）──
+    // daemonize() 会调用 chdir("/")，导致所有相对路径从根目录开始解析。
+    // 如果用户在根目录没有写权限，store.odb 创建会静默失败。
+    // 因此必须在守护进程化之前将 store_path 转为绝对路径。
+    let store_path = if Path::new(&args.store_path).is_relative() {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(&args.store_path)
+    } else {
+        PathBuf::from(&args.store_path)
+    };
+    let store_path = store_path.display().to_string();
+
     // ── 设置信号处理器 ──
     // 注册 SIGTERM/SIGINT 处理器
     daemon::setup_signal_handlers().expect("setup signal handlers");
@@ -153,10 +166,10 @@ fn main() {
     log::info!("minios server starting...");
 
     // ── 打开或创建存储文件 ──
-    let mut store = if Path::new(&args.store_path).exists() {
+    let mut store = if Path::new(&store_path).exists() {
         // 文件存在 → 打开已有存储
-        log::info!("Opening existing store: {}", args.store_path);
-        ObjectStore::open(&args.store_path).unwrap_or_else(|e| {
+        log::info!("Opening existing store: {}", store_path);
+        ObjectStore::open(&store_path).unwrap_or_else(|e| {
             log::error!("Cannot open store: {e}");
             std::process::exit(1);
         })
@@ -164,9 +177,9 @@ fn main() {
         // 文件不存在 → 创建新存储
         log::info!(
             "Creating new store: {} (max_objects={}, total_blocks={})",
-            args.store_path, args.max_objects, args.total_blocks
+            store_path, args.max_objects, args.total_blocks
         );
-        ObjectStore::create(&args.store_path, args.max_objects, args.total_blocks)
+        ObjectStore::create(&store_path, args.max_objects, args.total_blocks)
             .unwrap_or_else(|e| {
                 log::error!("Cannot create store: {e}");
                 std::process::exit(1);
