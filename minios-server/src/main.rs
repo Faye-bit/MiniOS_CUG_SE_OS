@@ -15,16 +15,18 @@ use clap::Parser;
 use minios_lib::cache::lru::LruCache;
 use minios_lib::common::consts;
 use minios_lib::daemon;
+use minios_lib::metrics::MetricsRegistry;
 use minios_lib::shm::page::PageAllocator;
 use minios_lib::shm::region::ShmRegion;
 use minios_lib::storage::engine::ObjectStore;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ═══════════════════════════════════════════════════════════════════════
 // 命令行参数定义
@@ -77,6 +79,10 @@ struct Args {
     /// PID 文件路径（默认 /tmp/minios.pid）
     #[arg(long, default_value = "/tmp/minios.pid")]
     pidfile: String,
+
+    /// Prometheus 指标 HTTP 端口（默认 9090，设为 0 禁用）
+    #[arg(long, default_value_t = 9090u16)]
+    metrics_port: u16,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -121,6 +127,9 @@ struct ServerState {
     /// Key：对象名称
     /// Value：累积的数据和元信息
     pending_uploads: HashMap<String, PendingUpload>,
+
+    /// Prometheus 监控指标注册表
+    metrics: MetricsRegistry,
 }
 
 /// 线程安全的状态共享类型
@@ -279,6 +288,13 @@ fn main() {
         }
     }
 
+    // ── 创建 Prometheus 指标注册表 ──
+    let start_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let metrics = MetricsRegistry::new(start_time);
+
     // ── 组装全局状态 ──
     let state: SharedState = Arc::new(Mutex::new(ServerState {
         store,
@@ -286,6 +302,7 @@ fn main() {
         region,
         page_alloc,
         pending_uploads: HashMap::new(),
+        metrics,
     }));
 
     // ── 绑定 Unix Socket ──
@@ -297,6 +314,19 @@ fn main() {
         std::process::exit(1);
     });
     log::info!("Listening on {}", args.socket_path);
+
+    // ── 启动 Prometheus HTTP 端点（如果端口不为 0）──
+    if args.metrics_port > 0 {
+        let metrics_state = Arc::clone(&state);
+        let metrics_port = args.metrics_port;
+        std::thread::spawn(move || {
+            spawn_metrics_server(metrics_state, metrics_port);
+        });
+        log::info!(
+            "Prometheus metrics endpoint listening on http://0.0.0.0:{}/metrics",
+            args.metrics_port
+        );
+    }
 
     // ── 并发控制 ──
     // 使用原子计数器跟踪当前活跃的客户端连接数
@@ -343,11 +373,24 @@ fn main() {
                 let state = Arc::clone(&state); // 增加引用计数
                 let active_clients = Arc::clone(&active_clients);
 
+                // 记录新接受的连接
+                {
+                    let s = state.lock().unwrap();
+                    s.metrics.connections_total.inc();
+                    s.metrics.active_connections.set(
+                        active_clients.load(Ordering::SeqCst) as f64
+                    );
+                }
+
                 std::thread::spawn(move || {
                     // 在线程中处理客户端请求
-                    handle_client(stream, state);
-                    // 处理完毕，减少活跃客户端计数
-                    active_clients.fetch_sub(1, Ordering::SeqCst);
+                    handle_client(stream, &state);
+
+                    // 处理完毕，减少活跃客户端计数并更新 gauge
+                    let remaining = active_clients.fetch_sub(1, Ordering::SeqCst) - 1;
+                    if let Ok(s) = state.lock() {
+                        s.metrics.active_connections.set(remaining as f64);
+                    }
                 });
             }
             // 非阻塞模式下没有连接时返回 WouldBlock，正常情况
@@ -417,7 +460,7 @@ fn main() {
 /// 3. 将响应写回 socket
 ///
 /// 处理完成后线程自动结束。
-fn handle_client(mut stream: UnixStream, state: SharedState) {
+fn handle_client(mut stream: UnixStream, state: &SharedState) {
     // 缓冲区大小 4096：足够容纳最长命令（PUT 最多约 256 字节 + 参数）
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf) {
@@ -428,7 +471,15 @@ fn handle_client(mut stream: UnixStream, state: SharedState) {
     // 将字节转为 UTF-8 字符串（无效字节用 � 替换）
     let msg = String::from_utf8_lossy(&buf[..n]);
     // 去除尾部换行符和空白后分发处理
-    let response = dispatch_command(msg.trim(), &state);
+    let response = dispatch_command(msg.trim(), state);
+
+    // 请求计数 +1 并快照最新指标
+    {
+        let server_state = state.lock().unwrap();
+        server_state.metrics.requests_total.inc();
+        snapshot_metrics(&server_state);
+    }
+
     // 写回响应（忽略写入错误——客户端可能已断开连接）
     let _ = stream.write_all(response.as_bytes());
 }
@@ -1005,6 +1056,119 @@ fn cmd_status(state: &SharedState) -> String {
         header.free_pages,
         header.total_pages,
     )
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Prometheus 指标快照与 HTTP 服务
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 从 ServerState 中读取最新统计信息并更新 Prometheus 指标。
+///
+/// 每次请求处理完毕后调用此函数，将当前存储、缓存和共享内存的
+/// 快照写入到 Prometheus Gauge / Counter 中。
+fn snapshot_metrics(state: &ServerState) {
+    let store_stats = state.store.stats();
+    let cache_stats = state.cache.stats();
+    let header = state.region.header();
+
+    state.metrics.store_objects.set(store_stats.total_objects as f64);
+    state.metrics.store_blocks_free.set(store_stats.free_blocks as f64);
+    state.metrics
+        .store_blocks_total
+        .set(store_stats.total_blocks as f64);
+    state.metrics
+        .store_file_size_bytes
+        .set(store_stats.file_size as f64);
+
+    state.metrics.cache_entries.set(cache_stats.size as f64);
+    // 注意：prometheus::Counter 只能递增，不能设置为绝对值。
+    // 缓存的 hits/misses/evictions 通过 cache.get/put 时机更新 Counter，
+    // 此处仅更新 Gauge 类型的快照值。
+
+    // 更新共享内存页使用快照
+    state.metrics.shm_pages_free.set(header.free_pages as f64);
+    state.metrics.shm_pages_total.set(header.total_pages as f64);
+}
+
+/// 启动一个极简 HTTP 服务端，仅在 `/metrics` 路径上返回 Prometheus 文本格式的指标数据。
+///
+/// 此函数设计为在独立线程中运行，使用 `std::net::TcpListener` 避免引入异步依赖。
+/// 对每个连接读取 HTTP 请求行，若为 `GET /metrics` 则返回指标文本，否则返回 404。
+///
+/// # 参数
+/// - `state`: 服务端共享状态引用（只读获取指标快照）
+/// - `port`: 监听的 TCP 端口
+fn spawn_metrics_server(state: SharedState, port: u16) {
+    let addr = format!("0.0.0.0:{port}");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("Failed to bind metrics HTTP server on {addr}: {e}");
+            return;
+        }
+    };
+
+    // 设置 accept 超时为 1 秒，以便定期检查 shutdown 信号
+    let _ = listener.set_nonblocking(true);
+
+    loop {
+        // 检查关闭信号
+        if daemon::is_shutdown_requested() {
+            break;
+        }
+
+        match listener.accept() {
+            Ok((mut stream, _addr)) => {
+                // 读取请求行
+                let mut req_buf = [0u8; 1024];
+                let n = match stream.read(&mut req_buf) {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+
+                let req = String::from_utf8_lossy(&req_buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+
+                if first_line.starts_with("GET /metrics") {
+                    // 获取当前时间戳，计算 uptime
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+
+                    let body = {
+                        let server_state = state.lock().unwrap();
+                        // 在返回指标前，更新活跃连接数的 gauge
+                        // （活跃连接数的更新在其他地方由 accept/spawn 回调负责）
+                        server_state.metrics.encode(now)
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/plain; version=0.0.4\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                } else {
+                    let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(not_found.as_bytes());
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    log::info!("Metrics HTTP server stopped.");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

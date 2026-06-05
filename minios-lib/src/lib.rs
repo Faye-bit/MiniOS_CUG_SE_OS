@@ -7,6 +7,7 @@ pub mod common;
 
 pub mod cache;
 pub mod daemon;
+pub mod metrics;
 pub mod protocol;
 pub mod shm;
 pub mod storage;

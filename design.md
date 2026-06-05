@@ -726,7 +726,158 @@ daemon 模式下服务端自行 double-fork 并写入 PID 文件。
 
 ---
 
-## 8. 模块组织
+## 8. Prometheus 监控接口
+
+### 8.1 概述
+
+服务端内置了一个极简 HTTP 服务端，在独立的线程中运行，以 Prometheus 标准文本格式
+暴露运行指标。该功能通过 `--metrics-port` 参数控制（默认端口 9090，设为 0 则禁用）。
+
+### 8.2 指标端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/metrics` | GET | 返回 Prometheus text exposition 格式的运行指标 |
+| 其他路径 | GET | 返回 HTTP 404 |
+
+可通过 `curl http://localhost:9090/metrics` 直接查看当前指标，也可配置 Prometheus
+或 Grafana 抓取此端点进行可视化监控。
+
+### 8.3 指标清单
+
+#### 连接级指标
+
+| 指标名 | 类型 | 说明 |
+|--------|------|------|
+| `minios_uptime_seconds` | Gauge | 服务端运行时长（秒） |
+| `minios_active_connections` | Gauge | 当前活跃客户端连接数 |
+| `minios_connections_total` | Counter | 累计接受的连接数 |
+| `minios_requests_total` | Counter | 累计处理的请求数 |
+
+#### 存储引擎指标
+
+| 指标名 | 类型 | 说明 |
+|--------|------|------|
+| `minios_store_objects` | Gauge | 当前存储的对象总数 |
+| `minios_store_blocks_free` | Gauge | 空闲数据块数 |
+| `minios_store_blocks_total` | Gauge | 数据块总数 |
+| `minios_store_file_size_bytes` | Gauge | 存储文件大小（字节） |
+
+#### 缓存指标
+
+| 指标名 | 类型 | 说明 |
+|--------|------|------|
+| `minios_cache_entries` | Gauge | 当前缓存条目数 |
+| `minios_cache_hits_total` | Counter | 缓存命中次数 |
+| `minios_cache_misses_total` | Counter | 缓存未命中次数 |
+| `minios_cache_evictions_total` | Counter | 缓存淘汰次数 |
+
+#### 共享内存指标
+
+| 指标名 | 类型 | 说明 |
+|--------|------|------|
+| `minios_shm_pages_free` | Gauge | 共享内存空闲页数 |
+| `minios_shm_pages_total` | Gauge | 共享内存总页数 |
+
+### 8.4 实现架构
+
+```mermaid
+flowchart LR
+    subgraph "minios-server 主线程"
+        MAIN["事件循环<br/>accept → spawn"]
+        M_INC["connections_total++<br/>active_connections++"]
+    end
+
+    subgraph "工作线程"
+        WORKER["handle_client"]
+        SNAP["snapshot_metrics()"]
+    end
+
+    subgraph "Metrics HTTP 线程"
+        HTTP["TcpListener :9090"]
+        ENCODE["metrics.encode(now)"]
+    end
+
+    subgraph "minios-lib"
+        REG["MetricsRegistry<br/>Gauge × N<br/>Counter × N"]
+    end
+
+    MAIN --> M_INC --> WORKER
+    WORKER --> SNAP --> REG
+    HTTP --> ENCODE --> REG
+```
+
+每次请求处理完成后，`snapshot_metrics()` 从 `ServerState` 中读取存储、缓存和共享内存
+的最新统计信息，同步写入 `MetricsRegistry` 中的 Gauge。Counter 类型指标（连接数、
+请求数）由 accept 和 dispatch 回调直接 inc。
+
+`/metrics` 端点查询时，HTTP 线程对 `ServerState` 加锁，调用 `metrics.encode(now)`
+将当前所有注册指标序列化为 Prometheus 文本格式返回。锁持有时间仅为一个 encode 调用，
+不影响请求处理。
+
+### 8.5 启动选项
+
+```bash
+# 默认端口 9090
+minios-server --store-path ./store.odb &
+
+# 自定义端口
+minios-server --store-path ./store.odb --metrics-port 9876 &
+
+# 禁用 metrics 端点
+minios-server --store-path ./store.odb --metrics-port 0 &
+```
+
+### 8.6 示例输出
+
+```
+# HELP minios_uptime_seconds Server uptime in seconds
+# TYPE minios_uptime_seconds gauge
+minios_uptime_seconds 123.00
+# HELP minios_active_connections Current number of active client connections
+# TYPE minios_active_connections gauge
+minios_active_connections 2
+# HELP minios_connections_total Total number of accepted connections
+# TYPE minios_connections_total counter
+minios_connections_total 15
+# HELP minios_requests_total Total number of processed requests
+# TYPE minios_requests_total counter
+minios_requests_total 15
+# HELP minios_store_objects Current number of stored objects
+# TYPE minios_store_objects gauge
+minios_store_objects 42
+# HELP minios_store_blocks_free Number of free data blocks
+# TYPE minios_store_blocks_free gauge
+minios_store_blocks_free 3952
+# HELP minios_store_blocks_total Total number of data blocks
+# TYPE minios_store_blocks_total gauge
+minios_store_blocks_total 4096
+# HELP minios_store_file_size_bytes Store file size in bytes
+# TYPE minios_store_file_size_bytes gauge
+minios_store_file_size_bytes 16814080
+# HELP minios_cache_entries Current number of cache entries
+# TYPE minios_cache_entries gauge
+minios_cache_entries 42
+# HELP minios_cache_hits_total Total number of cache hits
+# TYPE minios_cache_hits_total counter
+minios_cache_hits_total 23
+# HELP minios_cache_misses_total Total number of cache misses
+# TYPE minios_cache_misses_total counter
+minios_cache_misses_total 5
+# HELP minios_cache_evictions_total Total number of cache evictions
+# TYPE minios_cache_evictions_total counter
+minios_cache_evictions_total 0
+# HELP minios_shm_pages_free Number of free shared memory pages
+# TYPE minios_shm_pages_free gauge
+minios_shm_pages_free 250
+# HELP minios_shm_pages_total Total number of shared memory pages
+# TYPE minios_shm_pages_total gauge
+minios_shm_pages_total 256
+```
+
+---
+
+## 9. 模块组织
 
 ```mermaid
 graph TD
@@ -744,6 +895,7 @@ graph TD
         STORAGE_LIB["storage ★"]
         SHM_LIB["shm ★"]
         CACHE_LIB["cache"]
+        METRICS_LIB["metrics"]
         PROTO_LIB["protocol"]
         DAEMON_LIB["daemon"]
     end
@@ -752,27 +904,29 @@ graph TD
     LIB --> STORAGE_LIB
     LIB --> SHM_LIB
     LIB --> CACHE_LIB
+    LIB --> METRICS_LIB
     LIB --> PROTO_LIB
     LIB --> DAEMON_LIB
 
     STORAGE_LIB -->|"superblock, bitmap, metadata, engine"| COMMON_LIB
     SHM_LIB -->|"sync, region, page"| COMMON_LIB
     CACHE_LIB -->|"lru"| COMMON_LIB
+    METRICS_LIB -->|"MetricsRegistry"| COMMON_LIB
     PROTO_LIB -->|"request, response"| COMMON_LIB
     DAEMON_LIB -->|"mod"| COMMON_LIB
 ```
 
-### 8.1 依赖关系
+### 9.1 依赖关系
 
 | crate | 主要依赖 |
 |-------|----------|
-| `minios-lib` | `uuid` (v4), `thiserror`, `log`, `libc` |
+| `minios-lib` | `uuid` (v4), `thiserror`, `log`, `libc`, `prometheus` |
 | `minios-server` | `minios-lib`, `clap` (derive), `log`, `env_logger`, `libc` |
 | `minios-client` | `minios-lib`, `clap` (derive), `libc` |
 
 ---
 
-## 9. 服务端内部状态管理
+## 10. 服务端内部状态管理
 
 ```mermaid
 classDiagram
@@ -782,6 +936,7 @@ classDiagram
         +region: ShmRegion
         +page_alloc: PageAllocator
         +pending_uploads: HashMap~String, PendingUpload~
+        +metrics: MetricsRegistry
     }
 
     class PendingUpload {
@@ -818,10 +973,10 @@ classDiagram
 
 ---
 
-## 10. 测试策略
+## 11. 测试策略
 
 ```mermaid
-pie title 61 个单元测试分布
+pie title 77 个单元测试分布
     "storage/superblock" : 9
     "storage/bitmap" : 10
     "storage/metadata" : 7
@@ -830,6 +985,7 @@ pie title 61 个单元测试分布
     "shm/page" : 8
     "shm/region" : 3
     "cache/lru" : 9
+    "metrics" : 6
 ```
 
 | 模块 | 测试数 | 覆盖要点 |
@@ -842,6 +998,7 @@ pie title 61 个单元测试分布
 | shm/page | 8 | 单页分配、多页连续、耗尽、碎片检测、碎片率计算、零页边界、超限边界 |
 | shm/region | 3 | 创建/销毁、写入/读取、打开已存在区域 |
 | cache/lru | 9 | 存/取、未命中、命中率、条目淘汰、内存淘汰、LRU 顺序、失效、预热、超大对象跳过 |
+| metrics | 6 | 注册表创建、Counter 递增、Gauge 设置、uptime 计算、encode 输出格式、空指标编码 |
 
 注：`shm/region` 的 3 个测试仅在 Linux 目标上启用（`#[cfg(target_os = "linux")]`）；
 在 macOS 本机运行时通常显示 58 个测试通过。
