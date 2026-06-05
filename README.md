@@ -186,7 +186,7 @@ shm_pages_free: 250/256
 
 ```bash
 # 清理上次测试的残留文件
-rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minios.log /tmp/minios.sock /tmp/minios.pid
+rm -f ./store.odb /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/minios.log /tmp/minios.sock /tmp/minios.pid
 ```
 
 ### 1. 启动服务端
@@ -231,104 +231,19 @@ echo "Hello, MiniOS! This is a test file." > /tmp/test_file.txt
 # a64e240a... hello-world    37 text/plain 1779982957
 ```
 
-### 4. 下载对象与缓存命中率验证
-
-MiniOS 在服务端内存中维护了一个 **LRU（最近最少使用）缓存**，用于加速重复访问的对象。每当客户端 GET 一个对象时，服务端优先查缓存；如果命中则直接返回，否则从磁盘读取后放入缓存。`cache_hit_rate` 指标反映了缓存的效率。
-
-**4.1 首次 GET —— 观察缓存命中率从 0 开始变化**
+### 4. 下载对象
 
 ```bash
-# 在进行任何 GET 操作之前，先查看缓存状态
-./target/release/minios-client status
-# =>
-# OK
-# ...
-# cache_hit_rate: 0.00    ← 还没有发生过任何 GET 请求，命中次数和未命中次数均为 0
-# ...
-```
-
-> **为什么 `cache_hit_rate` 是 0.00？** 因为命中率的计算公式是 `hits / (hits + misses)`。当前 `hits=0, misses=0`，公式返回 0.0。刚刚的 PUT 操作虽然会把对象放入缓存，但并不会计入命中/未命中统计——只有 GET 操作才会触发缓存查询。
-
-现在执行第一次 GET 请求：
-
-```bash
-# 按名称下载对象（上传时已放入缓存，所以第一次 GET 就是缓存命中）
+# 按名称下载（输出到 stdout）
 ./target/release/minios-client get hello-world
 # => Hello, MiniOS! This is a test file.
-```
 
-```bash
-# 再次查看状态，观察 hit_rate 的变化
-./target/release/minios-client status
-# =>
-# OK
-# ...
-# cache_hit_rate: 1.00    ← 1 次命中 / 1 次查询 = 100%
-# ...
-```
-
-**解读**：`hello-world` 在上传时就已经被 `LruCache::put()` 放入了缓存。当 GET 请求到来时，`cache.get()` 在 HashMap 中找到了它，记录一次命中（`hits += 1`）。因此 `hit_rate = 1/1 = 1.00`。
-
-> **缓存查找逻辑**（`minios-server/src/main.rs:cmd_get()`）：
-> ```rust
-> // 第一步：查缓存
-> if let Some(data) = server_state.cache.get(&uuid) {
->     return write_get_result(&mut server_state, data);  // 命中！直接返回
-> }
-> // 第二步：缓存未命中 → 从磁盘读取
-> match server_state.store.get_by_id(&uuid) {
->     Ok(Some(obj)) => {
->         server_state.cache.put(uuid, obj.data, name, size); // 放入缓存
->         write_get_result(&mut server_state, obj.data)
->     }
->     // ...
-> }
-> ```
-
-**4.2 多次 GET 同一对象 —— 观察命中率持续走高**
-
-```bash
-# 连续多次 GET 同一个文件，每次都会命中缓存
-for i in $(seq 1 5); do
-    ./target/release/minios-client get hello-world > /dev/null
-done
-
-# 查看缓存统计
-./target/release/minios-client status
-# =>
-# OK
-# ...
-# cache_hit_rate: 1.00    ← 6 次命中 / 6 次查询 = 100%（因为对象一直在缓存中）
-# ...
-```
-
-**4.3 按 UUID 下载**
-
-```bash
 # 按 UUID 下载并保存到文件
 UUID=$(./target/release/minios-client list | grep hello-world | awk '{print $1}')
 ./target/release/minios-client get "$UUID" --output /tmp/downloaded.txt
 cat /tmp/downloaded.txt
 # => Hello, MiniOS! This is a test file.
-
-# 再次查看状态——UUID 查找同样是先查缓存
-./target/release/minios-client status
-# =>
-# ...
-# cache_hit_rate: 1.00    ← 7 次命中 / 7 次查询
-# ...
 ```
-
-**缓存机制小结**：
-
-| 操作 | 缓存行为 | 对 `hit_rate` 的影响 |
-|------|---------|---------------------|
-| PUT（上传） | 将新对象放入缓存 `cache.put()` | 不影响（不触发查询） |
-| GET（命中） | `cache.get()` 找到 → `hits += 1` | 命中率上升 |
-| GET（未命中） | `cache.get()` 未找到 → `misses += 1`，然后从磁盘加载并放入缓存 | 命中率下降 |
-| DELETE（删除） | `cache.invalidate()` 从缓存中移除 | 不影响 |
-
-> **提示**：在默认配置下（`--cache-capacity 128`），上传的对象数量不超过 128 时，所有对象都会留在缓存中，因此每次 GET 都是命中。如果想观察"缓存未命中"的场景，可以将缓存容量设小（如 `--cache-capacity 2`），然后上传 5 个文件——前 3 个会被 LRU 淘汰出缓存，再次 GET 它们时就会触发磁盘读取（miss）。
 
 ### 5. 带标签上传与标签效果展示
 
@@ -482,7 +397,157 @@ echo "=== 并发上传完成 ==="
 
 **并发安全机制**: 多个客户端进程通过共享内存传输数据，使用 `pthread_mutex_t`（`PTHREAD_PROCESS_SHARED`）保护页分配位图的并发访问。客户端在持有锁期间完成页分配和数据写入，释放锁后再发送 socket 命令，避免死锁。页由服务端处理请求时释放，客户端不重复释放，防止并发竞态。
 
-### 9. 删除对象
+### 9. 缓存命中率验证 — 命中与未命中的完整展示
+
+此时系统中已有约 16 个对象（2 个基础文件 + 2 个标签文件 + 1 个大文件 + 10 个并发文件 + 可能的残留文件）。下面通过缩小缓存容量来**人为制造缓存淘汰**，直观展示命中（hit）和未命中（miss）对 `cache_hit_rate` 的影响。
+
+**9.1 用极小缓存重启服务端**
+
+```bash
+# 停止当前服务端
+./target/release/minios-client stop
+sleep 1
+
+# 用极小缓存重启：只能容纳 4 个条目
+./target/release/minios-server \
+    --store-path ./store.odb \
+    --socket-path /tmp/minios.sock \
+    --shm-name /minios_shm \
+    --cache-capacity 4 \
+    --cache-memory-mb 1 \
+    > /tmp/minios.log 2>&1 &
+sleep 1
+
+# 查看初始缓存状态——缓存预热只能加载 4 个对象，其余 12+ 个对象不在缓存中
+./target/release/minios-client status
+# =>
+# OK
+# ...
+# cache_entries: 4/4          ← 缓存已满（预热了 4 个对象）
+# cache_hit_rate: 0.00        ← 尚未发生任何 GET 查询
+# ...
+```
+
+> **缓存预热回顾**：服务端启动时调用 `LruCache::warmup()`，从 `store.odb` 遍历活跃对象并加载到缓存，最多加载 `cache_capacity` 个。当 `capacity=4` 而对象总数超过 4 时，只有前 4 个被加载，其余对象处于"仅在磁盘"状态。
+
+**9.2 命中预热对象**
+
+```bash
+# GET 一个在预热范围内的文件 → 缓存命中
+./target/release/minios-client get hello-world
+# => Hello, MiniOS! This is a test file.
+
+./target/release/minios-client status
+# =>
+# cache_hit_rate: 1.00        ← 1 hit / 1 query = 100%
+```
+
+**9.3 未命中——触发磁盘读取**
+
+```bash
+# GET 一个不在缓存中的文件（预热时没加载，也从未被访问过）
+# 服务端先查缓存：miss → 从 store.odb 磁盘读取 → 放入缓存（淘汰最旧的条目）
+./target/release/minios-client get concurrent-1
+# => concurrent-data-1
+
+./target/release/minios-client status
+# =>
+# cache_hit_rate: 0.50        ← 1 hit + 1 miss → 1/2 = 50%
+```
+
+> **发生了什么？** 服务端执行了完整的"缓存未命中"路径：
+> 1. `cache.get_by_name("concurrent-1")` → 返回 `None`（`misses += 1`）
+> 2. `store.get_by_name("concurrent-1")` → 从磁盘遍历块链表读取数据
+> 3. `cache.put(uuid, data, name, size)` → 将刚读到的数据放入缓存（此时若缓存已满，淘汰最久未使用的条目）
+> 4. 将数据写入共享内存返回给客户端
+
+**9.4 再次访问同一对象——从"未命中"到"命中"**
+
+```bash
+# 再次 GET 同一个文件 → 这次在缓存中！（刚被 9.3 的 put 放入）
+./target/release/minios-client get concurrent-1
+# => concurrent-data-1
+
+./target/release/minios-client status
+# =>
+# cache_hit_rate: 0.67        ← 2 hits + 1 miss → 2/3 ≈ 67%
+```
+
+**命中率趋势解读**：
+
+```
+操作                          hits  misses  hit_rate
+────────────────────────────  ────  ──────  ────────
+初始状态                       0     0       0.00
+GET hello-world    (命中)      1     0       1.00
+GET concurrent-1   (未命中)    1     1       0.50   ← 跌到 50%
+GET concurrent-1   (命中)      2     1       0.67   ← 回升到 67%
+```
+
+**9.5 再制造一次未命中并观察持续变化**
+
+```bash
+# GET 另一个不在缓存中的文件 → 再次 miss
+./target/release/minios-client get concurrent-5
+# => concurrent-data-5
+
+# 命中率继续下降
+./target/release/minios-client status
+# =>
+# cache_hit_rate: 0.50        ← 2 hits + 2 misses → 2/4 = 50%
+
+# 再次访问 → 又命中
+./target/release/minios-client get concurrent-5
+# => concurrent-data-5
+
+./target/release/minios-client status
+# =>
+# cache_hit_rate: 0.60        ← 3 hits + 2 misses → 3/5 = 60%
+```
+
+**9.6 恢复默认配置**
+
+```bash
+# 缓存演示完毕，恢复为正常配置的服务端
+./target/release/minios-client stop
+sleep 1
+./target/release/minios-server \
+    --store-path ./store.odb \
+    --socket-path /tmp/minios.sock \
+    --shm-name /minios_shm \
+    > /tmp/minios.log 2>&1 &
+sleep 1
+```
+
+**缓存机制总结**：
+
+| 场景 | `cache.get()` 返回值 | 计数变化 | `hit_rate` 趋势 |
+|------|---------------------|---------|----------------|
+| 对象在缓存中 | `Some(&data)` | `hits += 1` | 上升 |
+| 对象不在缓存中 | `None` | `misses += 1` | 下降 |
+| 未命中后从磁盘加载 | — | `cache.put()` 放入缓存 | 下次再访问该对象将命中 |
+
+> **关键代码路径**（`minios-server/src/main.rs:cmd_get()`）：
+> ```rust
+> // 第一步：查缓存（按名称或 UUID）
+> if let Some(data) = server_state.cache.get_by_name(id) {
+>     return write_get_result(&mut server_state, data); // 命中→直接返回
+> }
+> // 第二步：缓存未命中→从磁盘读取
+> match server_state.store.get_by_name(id) {
+>     Ok(Some(obj)) => {
+>         // 将刚读到的数据放入缓存（可能触发 LRU 淘汰）
+>         server_state.cache.put(uuid, obj.data.clone(), name, size);
+>         write_get_result(&mut server_state, obj.data)
+>     }
+>     Ok(None) => "ERROR object not found\n".into(),
+>     Err(e) => format!("ERROR {e}\n"),
+> }
+> ```
+>
+> **LRU 淘汰逻辑**（`cache/lru.rs:evict_one()`）：当缓存已满时，从 `VecDeque` 头部弹出最久未使用的条目，从 `HashMap` 和 `name_index` 中移除，`evictions += 1`。
+
+### 10. 删除对象
 
 ```bash
 # 删除指定对象
@@ -495,7 +560,7 @@ UUID=$(./target/release/minios-client list | grep config | awk '{print $1}')
 # => (无输出)
 ```
 
-### 10. 停止服务
+### 11. 停止服务
 
 ```bash
 # 方式 1：客户端 stop 命令（推荐）
@@ -506,7 +571,7 @@ UUID=$(./target/release/minios-client list | grep config | awk '{print $1}')
 kill $SERVER_PID 2>/dev/null
 ```
 
-### 11. 守护进程模式（可选）
+### 12. 守护进程模式（可选）
 
 ```bash
 # 以守护进程方式启动
@@ -523,7 +588,7 @@ kill $(cat /tmp/minios.pid)  # 停止守护进程
 ### 清理
 
 ```bash
-rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/downloaded.txt \
+rm -f ./store.odb /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/downloaded.txt \
       /tmp/meta.json /tmp/meta_v2.json /tmp/concurrent_*.txt /tmp/minios.log /tmp/minios.sock /tmp/minios.pid
 ```
 
