@@ -24,7 +24,7 @@ pub mod flags {
 /// 使内存布局与磁盘序列化格式完全一致（均为 256 字节）。
 ///
 /// 内存/磁盘布局（偏移量）：
-/// ```text
+/// ``` text
 ///   0..16  uuid           [u8; 16]
 ///  16..80  name           [u8; 64]
 ///  80..88  size           u64
@@ -118,11 +118,11 @@ impl MetadataEntry {
     /// 从 256 字节数组反序列化。
     pub fn from_bytes(bytes: &[u8; 256]) -> Self {
         let mut offset = 0;
-
+        // 按照字段顺序逐个读取，更新 offset
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&bytes[offset..offset + 16]);
         offset += 16;
-
+        
         let mut name = [0u8; 64];
         name.copy_from_slice(&bytes[offset..offset + 64]);
         offset += 64;

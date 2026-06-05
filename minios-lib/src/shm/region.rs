@@ -80,11 +80,12 @@ pub struct ShmRegion {
 unsafe impl Send for ShmRegion {}
 
 impl ShmRegion {
-    /// 创建共享内存区域（服务端调用）。
+    /// 创建共享内存区域，供服务端调用。
     pub fn create(name: &str, num_data_pages: u32) -> MiniosResult<Self> {
         let page_size = consts::SHM_PAGE_SIZE as usize;
-
+        // 控制页布局：header + 位图 + 互斥锁 → 计算位图和互斥锁偏移，并确保控制页大小不超过一页
         let header_size = std::mem::size_of::<ShmControlHeader>();
+        // 位图大小 = ceil(num_data_pages/8) 字节，8 字节对齐
         let bitmap_size = ((num_data_pages as usize + 7) / 8 + 7) / 8 * 8;
         let bitmap_offset = header_size as u32;
         let bitmap_size_u32 = bitmap_size as u32;
@@ -102,9 +103,9 @@ impl ShmRegion {
         let cname = CString::new(name).map_err(|e| {
             MiniosError::ShmError(format!("invalid shm name: {e}"))
         })?;
-
+        // 先 unlink 以防已存在同名共享内存（忽略错误）
         unsafe { libc::shm_unlink(cname.as_ptr()) };
-
+        // 创建共享内存对象
         let shm_fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
         if shm_fd < 0 {
             return Err(MiniosError::ShmError(format!(
@@ -112,7 +113,7 @@ impl ShmRegion {
                 io::Error::last_os_error()
             )));
         }
-
+        // 设置共享内存大小
         let ret = unsafe { libc::ftruncate(shm_fd, region_size as libc::off_t) };
         if ret != 0 {
             unsafe {
@@ -124,7 +125,7 @@ impl ShmRegion {
                 io::Error::last_os_error()
             )));
         }
-
+        // 映射共享内存到当前进程地址空间
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -145,7 +146,7 @@ impl ShmRegion {
                 io::Error::last_os_error()
             )));
         }
-
+        // 共享内存映射成功，初始化控制头和互斥锁
         let region_ptr = ptr as *mut u8;
 
         // 写入控制头（位图紧随 header 之后）
@@ -156,7 +157,7 @@ impl ShmRegion {
 
         // 在位图之后初始化跨进程互斥锁
         let page_mutex = unsafe { ShmMutex::init_at(region_ptr.add(mutex_off))? };
-
+        // 数据页初始全空闲（位图全 1）
         Ok(Self {
             ptr: region_ptr,
             size: region_size,
@@ -168,10 +169,11 @@ impl ShmRegion {
 
     /// 打开已存在的共享内存区域（客户端调用）。
     pub fn open(name: &str) -> MiniosResult<Self> {
+        // 转换名称为 C 字符串
         let cname = CString::new(name).map_err(|e| {
             MiniosError::ShmError(format!("invalid shm name: {e}"))
         })?;
-
+        // 打开共享内存对象
         let shm_fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0o600) };
         if shm_fd < 0 {
             return Err(MiniosError::ShmError(format!(
@@ -180,7 +182,7 @@ impl ShmRegion {
                 io::Error::last_os_error()
             )));
         }
-
+        // 获取共享内存大小以便映射
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         let ret = unsafe { libc::fstat(shm_fd, &mut stat) };
         if ret != 0 {
@@ -191,7 +193,7 @@ impl ShmRegion {
             )));
         }
         let region_size = stat.st_size as usize;
-
+        // 映射共享内存到当前进程地址空间
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -209,7 +211,7 @@ impl ShmRegion {
                 io::Error::last_os_error()
             )));
         }
-
+        // 共享内存映射成功，验证控制头并打开互斥锁
         let region_ptr = ptr as *mut u8;
 
         // 在打开互斥锁前先验证控制头

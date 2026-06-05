@@ -25,14 +25,14 @@ pub struct BlockBitmap {
 impl BlockBitmap {
     /// 创建一个新的位图，所有块初始标记为空闲。
     pub fn new(total_blocks: u64) -> Self {
-        let words = (total_blocks as usize + 63) / 64;
-        let mut bits = vec![u64::MAX; words];
+        let words = (total_blocks as usize + 63) / 64; // 计算需要多少个 u64 来存储 total_blocks 位（向上取整）
+        let mut bits = vec![u64::MAX; words]; // 初始全 1 表示所有块空闲
 
         // 最后一个字中超出 total_blocks 的位应标记为"已占用"（不可分配）
-        let valid_in_last = total_blocks % 64;
+        let valid_in_last = total_blocks % 64; // 最后一个字中有效的位数
         if valid_in_last != 0 {
-            let mask = (1u64 << valid_in_last) - 1;
-            let last = bits.last_mut().unwrap();
+            let mask = (1u64 << valid_in_last) - 1; // 生成一个掩码，低 valid_in_last 位为 1，其余为 0
+            let last = bits.last_mut().unwrap(); // 获取最后一个 u64 的可变引用
             *last = mask;
         }
 
@@ -48,19 +48,19 @@ impl BlockBitmap {
     /// `data` 为原始字节（来自 store.odb 的位图区），
     /// `total_blocks` 从超级块中读取。
     pub fn from_bytes(data: &[u8], total_blocks: u64) -> Self {
-        let words = (total_blocks as usize + 63) / 64;
-        let mut bits = vec![0u64; words];
-
+        let words = (total_blocks as usize + 63) / 64; // 计算需要多少个 u64 来存储 total_blocks 位（向上取整）
+        let mut bits = vec![0u64; words]; // 初始化为全 0（所有块占用），后续根据 data 设置空闲位
+        // 将字节数据转换为 u64 位图
         for (i, chunk) in data.chunks(8).enumerate() {
-            if i >= words {
+            if i >= words { // 安全检查：如果 data 中的位图数据超过了 total_blocks 所需的字数，则忽略多余部分
                 break;
             }
-            let mut word_bytes = [0u8; 8];
-            let len = chunk.len().min(8);
-            word_bytes[..len].copy_from_slice(chunk);
-            bits[i] = u64::from_le_bytes(word_bytes);
+            let mut word_bytes = [0u8; 8]; // 用于存储当前 u64 的字节数据
+            let len = chunk.len().min(8); // 最后一个 chunk 可能不足 8 字节，需处理
+            word_bytes[..len].copy_from_slice(chunk); // 将 chunk 中的字节复制到 word_bytes 中
+            bits[i] = u64::from_le_bytes(word_bytes); // 将字节数组转换为 u64，假设数据低位在前
         }
-
+        // 计算 free_blocks 的数量（位图中值为 1 的位数）
         let free_blocks = bits.iter().map(|w| w.count_ones() as u64).sum();
 
         Self {
@@ -83,12 +83,12 @@ impl BlockBitmap {
     ///
     /// 使用 u64 字级别的 `trailing_zeros()` 指令进行快速扫描。
     pub fn allocate_one(&mut self) -> Option<u64> {
-        for (word_idx, word) in self.bits.iter_mut().enumerate() {
-            if *word != 0 {
-                let bit_idx = word.trailing_zeros() as usize;
+        for (word_idx, word) in self.bits.iter_mut().enumerate() { // 遍历位图中的每个 u64 字
+            if *word != 0 { // 如果当前字不全为 0，说明至少有一个空闲块
+                let bit_idx = word.trailing_zeros() as usize; // 找到最低位的 1 的索引，即第一个空闲块的位置
                 *word &= !(1u64 << bit_idx); // 清除该位（标记为占用）
                 self.free_blocks -= 1;
-                let block_idx = (word_idx * 64 + bit_idx) as u64;
+                let block_idx = (word_idx * 64 + bit_idx) as u64; // 计算块索引
                 // 防止分配超出 total_blocks 的位
                 if block_idx < self.total_blocks {
                     return Some(block_idx);
@@ -114,12 +114,12 @@ impl BlockBitmap {
             )));
         }
 
-        let mut allocated = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            match self.allocate_one() {
+        let mut allocated = Vec::with_capacity(count as usize); // 用于存储分配的块索引
+        for _ in 0..count { // 循环分配 count 个块
+            match self.allocate_one() { // 复用 allocate_one 的逻辑来分配单个块
                 Some(idx) => allocated.push(idx),
                 None => {
-                    // 回滚：释放已分配的块
+                    // 回滚：释放本次循环中已分配的块
                     for idx in &allocated {
                         self.free_block(*idx);
                     }
@@ -134,7 +134,7 @@ impl BlockBitmap {
 
     /// 释放指定块，标记为空闲。
     pub fn free_block(&mut self, block_idx: u64) {
-        assert!(
+        assert!( // 安全检查：确保 block_idx 在有效范围内
             block_idx < self.total_blocks,
             "block index {} out of range (total {})",
             block_idx,
@@ -142,11 +142,11 @@ impl BlockBitmap {
         );
         let word_idx = (block_idx / 64) as usize;
         let bit_idx = (block_idx % 64) as usize;
-        let mask = 1u64 << bit_idx;
+        let mask = 1u64 << bit_idx; // 计算对应位的掩码
 
         // 仅在块确实被占用时才更新计数（幂等释放）
         if self.bits[word_idx] & mask == 0 {
-            self.bits[word_idx] |= mask;
+            self.bits[word_idx] |= mask; // 设置该位为 1（标记为空闲）
             self.free_blocks += 1;
         }
     }

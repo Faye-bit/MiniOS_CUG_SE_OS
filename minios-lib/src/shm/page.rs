@@ -25,7 +25,7 @@ impl PageAllocator {
     /// 创建页分配器。
     ///
     /// # Safety
-    /// `bitmap_ptr` 和 `free_pages_ptr` 必须指向共享内存中的有效地址。
+    /// bitmap_ptr 和 free_pages_ptr 必须指向共享内存中的有效地址。
     pub unsafe fn new(
         bitmap_ptr: *mut u8,
         total_pages: u32,
@@ -38,10 +38,10 @@ impl PageAllocator {
         }
     }
 
-    /// 分配 `count` 个连续空闲页，返回起始页号。
+    /// 分配 count 个连续空闲页，返回起始页号。
     ///
-    /// 使用 First-Fit 算法在位图中查找连续的 `count` 个 1 位。
-    /// 如果不存在足够大的连续空闲块，返回 `None`（体现外部碎片问题）。
+    /// 使用首次适应算法在位图中查找连续的 count 个 1 位。
+    /// 如果不存在足够大的连续空闲块，返回 None。
     pub fn alloc_pages(&self, count: u32) -> Option<u32> {
         if count == 0 || count > self.total_pages {
             return None;
@@ -75,7 +75,7 @@ impl PageAllocator {
         None
     }
 
-    /// 分配 `count` 个连续空闲页，如果当前无足够连续空闲页则等待。
+    /// 分配 count 个连续空闲页，如果当前无足够连续空闲页则等待。
     ///
     /// 调用方在调用此方法时必须已持有页互斥锁。
     /// 当分配失败时，此方法会通过 `unlock`/`lock` 闭包暂时释放互斥锁，

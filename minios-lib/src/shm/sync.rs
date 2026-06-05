@@ -131,7 +131,7 @@ impl ShmSemaphore {
         let cname = CString::new(name).map_err(|e| {
             MiniosError::ShmError(format!("invalid semaphore name '{name}': {e}"))
         })?;
-
+        // 尝试创建信号量，如果已存在则打开
         let sem = unsafe {
             libc::sem_open(
                 cname.as_ptr(),
@@ -169,7 +169,7 @@ impl ShmSemaphore {
         let cname = CString::new(name).map_err(|e| {
             MiniosError::ShmError(format!("invalid semaphore name '{name}': {e}"))
         })?;
-
+        // 只打开已存在的信号量，不创建
         let sem = unsafe { libc::sem_open(cname.as_ptr(), 0) };
         if sem == libc::SEM_FAILED {
             let err = std::io::Error::last_os_error();
@@ -184,7 +184,7 @@ impl ShmSemaphore {
     /// 等待信号量（P 操作，减 1）。
     /// 如果当前值为 0 则阻塞。
     pub fn wait(&self) -> MiniosResult<()> {
-        let ret = unsafe { libc::sem_wait(self.sem) };
+        let ret = unsafe { libc::sem_wait(self.sem) }; // 阻塞等待直到 sem 的值 > 0，然后减 1
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             Err(MiniosError::ShmError(format!("sem_wait failed: {err}")))
@@ -211,7 +211,7 @@ impl ShmSemaphore {
 
     /// 发送信号量（V 操作，加 1）。
     pub fn post(&self) -> MiniosResult<()> {
-        let ret = unsafe { libc::sem_post(self.sem) };
+        let ret = unsafe { libc::sem_post(self.sem) }; // 将 sem 的值加 1，唤醒正在等待的线程/进程
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             Err(MiniosError::ShmError(format!("sem_post failed: {err}")))
