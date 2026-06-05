@@ -155,6 +155,14 @@ impl ObjectStore {
         content_type: &str,
         tags: &str,
     ) -> MiniosResult<ObjectId> {
+        // 0. 检查重名冲突 —— 必须先检查，避免已分配数据块后发现重名导致资源泄漏。
+        if self.find_by_name(name).is_some() {
+            return Err(MiniosError::ObjectAlreadyExists(format!(
+                "object with name '{}' already exists. Delete it first or use a different name.",
+                name
+            )));
+        }
+
         let data_len = data.len() as u64;
         let block_count = if data_len == 0 {
             0
@@ -222,6 +230,38 @@ impl ObjectStore {
         log::info!("PUT object: name={name}, uuid={uuid:x?}, size={data_len}, blocks={block_count}");
 
         Ok(uuid)
+    }
+
+    /// 存储对象，若名称已存在则自动删除旧对象后重写（force overwrite）。
+    ///
+    /// 流程：检查重名 → 删除旧对象 → 重新分配 → 写入。
+    /// 注意：此操作不是原子的——如果中途失败，旧对象已不可恢复。
+    pub fn put_overwrite(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        content_type: &str,
+        tags: &str,
+    ) -> MiniosResult<ObjectId> {
+        // 若名称已存在，先删除旧对象
+        if let Some(slot) = self.find_by_name(name) {
+            let old_uuid = self.metadata_cache[slot].uuid;
+            log::info!("PUT_OVERWRITE: deleting existing object '{}' (uuid={:x?})", name, old_uuid);
+            self.delete(&old_uuid)?;
+        }
+
+        // 重新执行普通 put 流程
+        self.put(name, data, content_type, tags)
+    }
+
+    /// 通过 UUID 仅获取对象元数据摘要（不读取数据块）。返回 `None` 表示未找到。
+    pub fn get_summary_by_id(&self, uuid: &ObjectId) -> Option<ObjectSummary> {
+        self.find_by_uuid(uuid).map(|slot| self.build_summary(slot))
+    }
+
+    /// 通过名称仅获取对象元数据摘要（不读取数据块）。返回 `None` 表示未找到。
+    pub fn get_summary_by_name(&self, name: &str) -> Option<ObjectSummary> {
+        self.find_by_name(name).map(|slot| self.build_summary(slot))
     }
 
     /// 通过 UUID 获取对象数据。返回 `None` 表示未找到。
@@ -723,6 +763,108 @@ mod tests {
         assert_eq!(after.total_objects, 1);
         assert_eq!(after.used_blocks, 2); // 5000 bytes → 2 blocks
         assert_eq!(after.free_blocks + after.used_blocks, after.total_blocks);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── 新增测试：元数据摘要获取 ───
+
+    #[test]
+    fn test_get_summary_by_id() {
+        let path = temp_store_path("summary_by_id");
+        let mut store = create_test_store(&path);
+
+        let tags = r#"{"author":"test","version":1}"#;
+        let uuid = store.put("doc.txt", b"hello world", "text/plain", tags).unwrap();
+
+        let summary = store.get_summary_by_id(&uuid).expect("should find summary");
+        assert_eq!(summary.name, "doc.txt");
+        assert_eq!(summary.size, 11);
+        assert_eq!(summary.content_type, "text/plain");
+        assert_eq!(summary.tags, tags);
+        assert_eq!(summary.uuid, uuid);
+
+        // 不存在的 UUID 应返回 None
+        assert!(store.get_summary_by_id(&[0xFFu8; 16]).is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_get_summary_by_name() {
+        let path = temp_store_path("summary_by_name");
+        let mut store = create_test_store(&path);
+
+        let tags = r#"{"key":"value"}"#;
+        store.put("image.png", b"png_data", "image/png", tags).unwrap();
+
+        let summary = store.get_summary_by_name("image.png").expect("should find summary");
+        assert_eq!(summary.content_type, "image/png");
+        assert_eq!(summary.tags, tags);
+        assert_eq!(summary.size, 8);
+
+        // 不存在的名称应返回 None
+        assert!(store.get_summary_by_name("no_such").is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── 新增测试：重名检测 ───
+
+    #[test]
+    fn test_put_duplicate_name_rejected() {
+        let path = temp_store_path("dup_name");
+        let mut store = create_test_store(&path);
+
+        store.put("unique.txt", b"first", "text/plain", "").unwrap();
+
+        // 再次 put 同名对象应返回错误
+        let result = store.put("unique.txt", b"second", "text/plain", "");
+        assert!(result.is_err());
+
+        // 验证仍然是第一个对象
+        let obj = store.get_by_name("unique.txt").unwrap().unwrap();
+        assert_eq!(obj.data, b"first");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_put_overwrite_replaces_existing() {
+        let path = temp_store_path("overwrite");
+        let mut store = create_test_store(&path);
+
+        let uuid1 = store.put("data.bin", b"version 1", "app/bin", r#"{"v":1}"#).unwrap();
+
+        // 使用 put_overwrite 覆盖同名对象
+        let uuid2 = store.put_overwrite("data.bin", b"version 2", "app/bin", r#"{"v":2}"#).unwrap();
+
+        // 新 UUID 应不同于旧 UUID（因为创建了新对象）
+        assert_ne!(uuid1, uuid2);
+
+        // 旧 UUID 应不可查询
+        assert!(store.get_by_id(&uuid1).unwrap().is_none());
+
+        // 新对象应可通过名称查询并具有更新后的内容
+        let obj = store.get_by_name("data.bin").unwrap().unwrap();
+        assert_eq!(obj.data, b"version 2");
+        assert_eq!(obj.summary.tags, r#"{"v":2}"#);
+
+        // 列表应只有一个对象
+        assert_eq!(store.list().len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_put_overwrite_new_name_creates() {
+        let path = temp_store_path("overwrite_new");
+        let mut store = create_test_store(&path);
+
+        // 对不存在的名称使用 put_overwrite 等同于普通 put
+        let uuid = store.put_overwrite("new.txt", b"data", "text/plain", "").unwrap();
+        let obj = store.get_by_id(&uuid).unwrap().unwrap();
+        assert_eq!(obj.data, b"data");
 
         let _ = std::fs::remove_file(&path);
     }

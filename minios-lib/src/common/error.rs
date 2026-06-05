@@ -17,6 +17,10 @@ pub enum MiniosError {
     #[error("Object not found: {0}")]
     ObjectNotFound(String),
 
+    /// 对象名称已存在（上传时检测到重名冲突）
+    #[error("Object already exists: {0}")]
+    ObjectAlreadyExists(String),
+
     /// 存储空间不足
     #[error("No space left: {0}")]
     NoSpace(String),

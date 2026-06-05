@@ -449,9 +449,15 @@ fn handle_client(mut stream: UnixStream, state: SharedState) {
 /// PUT_END <name>
 /// ```
 ///
+/// ### 强制覆盖上传
+/// ```
+/// PUT_FORCE <name> <size> <content_type> <tags> <start_page> <num_pages>
+/// ```
+///
 /// ### 查询操作
 /// ```
 /// GET <uuid_or_name>
+/// INFO <uuid_or_name>
 /// DELETE <uuid>
 /// LIST
 /// STATUS
@@ -468,10 +474,13 @@ fn dispatch_command(msg: &str, state: &SharedState) -> String {
     // 命令名大小写不敏感
     match parts[0].to_uppercase().as_str() {
         "PUT" => cmd_put(&parts, state),
+        "PUT_FORCE" => cmd_put_force(&parts, state),
         "PUT_BEGIN" => cmd_put_begin(&parts, state),
         "PUT_CHUNK" => cmd_put_chunk(&parts, state),
         "PUT_END" => cmd_put_end(&parts, state),
+        "PUT_END_FORCE" => cmd_put_end_force(&parts, state),
         "GET" => cmd_get(&parts, state),
+        "INFO" => cmd_info(&parts, state),
         "DELETE" => cmd_delete(&parts, state),
         "LIST" => cmd_list(state),
         "STATUS" => cmd_status(state),
@@ -630,6 +639,40 @@ fn cmd_put_end(parts: &[&str], state: &SharedState) -> String {
     }
 }
 
+/// PUT_END_FORCE — 强制完成分块上传，若名称已存在则覆盖旧对象。
+///
+/// ## 协议格式
+/// `PUT_END_FORCE <name>`
+///
+/// 与 PUT_END 相同，但使用 put_overwrite 替代 put，
+/// 当目标名称已存在时自动删除旧对象后写入。
+fn cmd_put_end_force(parts: &[&str], state: &SharedState) -> String {
+    if parts.len() < 2 {
+        return "ERROR PUT_END_FORCE requires: name\n".into();
+    }
+    let name = parts[1].to_string();
+
+    let mut server_state = state.lock().unwrap();
+
+    let upload = match server_state.pending_uploads.remove(&name) {
+        Some(u) => u,
+        None => return "ERROR no pending upload for this name\n".into(),
+    };
+
+    let size = upload.data.len() as u64;
+
+    match server_state.store.put_overwrite(&name, &upload.data, &upload.content_type, &upload.tags) {
+        Ok(uuid) => {
+            server_state
+                .cache
+                .put(uuid, upload.data, name.clone(), size);
+            log::info!("PUT_END_FORCE: name={name}, uuid={:?}, size={size}", uuid_fmt(&uuid));
+            format!("OK {}\n", uuid_fmt(&uuid))
+        }
+        Err(e) => format!("ERROR {e}\n"),
+    }
+}
+
 /// 标准 PUT（小文件单次传输，保留向后兼容）
 ///
 /// ## 协议格式
@@ -677,6 +720,53 @@ fn cmd_put(parts: &[&str], state: &SharedState) -> String {
     match server_state.store.put(name, &data, content_type, tags) {
         Ok(uuid) => {
             // 加入缓存
+            server_state.cache.put(uuid, data, name.into(), size);
+            format!("OK {}\n", uuid_fmt(&uuid))
+        }
+        Err(e) => {
+            format!("ERROR {e}\n")
+        }
+    }
+}
+
+/// PUT_FORCE — 强制上传，若名称已存在则覆盖旧对象。
+///
+/// ## 协议格式
+/// `PUT_FORCE <name> <size> <content_type> <tags> <start_page> <num_pages>`
+///
+/// 与标准 PUT 相同，但当目标名称已存在时自动删除旧对象后写入。
+/// 警告：此操作会彻底删除旧对象及其数据，不可恢复。
+fn cmd_put_force(parts: &[&str], state: &SharedState) -> String {
+    if parts.len() < 7 {
+        return "ERROR PUT_FORCE requires: name size content_type tags start_page num_pages\n".into();
+    }
+
+    let name = parts[1];
+    let size: u64 = match parts[2].parse() {
+        Ok(v) => v,
+        Err(_) => return "ERROR invalid size\n".into(),
+    };
+    let content_type = parts[3];
+    let tags = parts[4];
+    let start_page: u32 = match parts[5].parse() {
+        Ok(v) => v,
+        Err(_) => return "ERROR invalid start_page\n".into(),
+    };
+    let num_pages: u32 = match parts[6].parse() {
+        Ok(v) => v,
+        Err(_) => return "ERROR invalid num_pages\n".into(),
+    };
+
+    let mut server_state = state.lock().unwrap();
+
+    server_state.region.lock_page_mutex().unwrap();
+    let data = server_state.region.read_from_pages(start_page, size);
+    server_state.page_alloc.free_pages(start_page, num_pages);
+    server_state.region.unlock_page_mutex().unwrap();
+
+    // 使用 put_overwrite：若名称已存在则先删除旧对象
+    match server_state.store.put_overwrite(name, &data, content_type, tags) {
+        Ok(uuid) => {
             server_state.cache.put(uuid, data, name.into(), size);
             format!("OK {}\n", uuid_fmt(&uuid))
         }
@@ -793,7 +883,7 @@ fn cmd_delete(parts: &[&str], state: &SharedState) -> String {
 /// ## 响应格式
 /// ```text
 /// OK <count>
-/// <uuid> <name> <size> <content_type> <created_at>
+/// <uuid> <name> <size> <content_type> <created_at> <tags>
 /// ...
 /// ```
 fn cmd_list(state: &SharedState) -> String {
@@ -806,15 +896,73 @@ fn cmd_list(state: &SharedState) -> String {
     // 逐行输出每个对象的摘要
     for obj in &objects {
         resp.push_str(&format!(
-            "{} {} {} {} {}\n",
+            "{} {} {} {} {} {}\n",
             uuid_fmt(&obj.uuid),    // UUID（32 字符十六进制）
             obj.name,                // 名称
             obj.size,                // 大小
             obj.content_type,        // MIME 类型
             obj.created_at,          // 创建时间戳
+            obj.tags,                // 自定义标签
         ));
     }
     resp
+}
+
+/// INFO — 获取单个对象的元数据（不读取数据块）
+///
+/// ## 协议格式
+/// `INFO <uuid_or_name>`
+///
+/// ## 查找策略
+/// 先尝试将参数解析为 UUID，如果成功则按 UUID 查找，否则按名称查找。
+///
+/// ## 响应格式
+/// ```text
+/// OK
+/// uuid: <32-char hex>
+/// name: <name>
+/// size: <bytes>
+/// content_type: <mime>
+/// created_at: <unix timestamp>
+/// tags: <json>
+/// block_count: <n>
+/// ```
+fn cmd_info(parts: &[&str], state: &SharedState) -> String {
+    if parts.len() < 2 {
+        return "ERROR INFO requires uuid or name\n".into();
+    }
+    let id = parts[1];
+    let server_state = state.lock().unwrap();
+
+    // 尝试按 UUID 查找，否则按名称查找
+    let summary = if let Some(uuid) = parse_uuid(id) {
+        server_state.store.get_summary_by_id(&uuid)
+    } else {
+        server_state.store.get_summary_by_name(id)
+    };
+
+    match summary {
+        Some(obj) => {
+            format!(
+                "OK\n\
+                 uuid: {}\n\
+                 name: {}\n\
+                 size: {}\n\
+                 content_type: {}\n\
+                 created_at: {}\n\
+                 tags: {}\n\
+                 block_count: {}\n",
+                uuid_fmt(&obj.uuid),
+                obj.name,
+                obj.size,
+                obj.content_type,
+                obj.created_at,
+                obj.tags,
+                obj.block_count,
+            )
+        }
+        None => format!("ERROR object not found: {id}\n"),
+    }
 }
 
 /// STATUS — 查看服务端运行状态

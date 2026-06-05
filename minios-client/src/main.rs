@@ -3,6 +3,7 @@
 //! 命令：
 //! - put <file>       上传文件（自动分块传输）
 //! - get <id>         下载对象
+//! - info <id>        查看对象元数据
 //! - delete <uuid>    删除对象
 //! - list             列出所有对象
 //! - status           查看服务端状态
@@ -37,11 +38,18 @@ enum Command {
         content_type: String,
         #[arg(long, default_value = "{}")]
         tags: String,
+        /// 强制覆盖已存在的同名对象
+        #[arg(short, long, default_value_t = false)]
+        force: bool,
     },
     Get {
         id: String,
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// 查看对象元数据（不下载数据）
+    Info {
+        id: String,
     },
     Delete {
         uuid: String,
@@ -75,8 +83,10 @@ fn main() {
             name,
             content_type,
             tags,
-        } => cmd_put(&cli, file, name, content_type, tags),
+            force,
+        } => cmd_put(&cli, file, name, content_type, tags, *force),
         Command::Get { id, output } => cmd_get(&cli, id, output),
+        Command::Info { id } => cmd_info(&cli, id),
         Command::Delete { uuid } => cmd_delete(&cli, uuid),
         Command::Start {
             server,
@@ -197,7 +207,7 @@ fn cmd_list(cli: &Cli) {
     print!("{resp}");
 }
 
-fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str, tags: &str) {
+fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str, tags: &str, force: bool) {
     let obj_name = name
         .clone()
         .unwrap_or_else(|| file.file_name().unwrap().to_string_lossy().to_string());
@@ -247,8 +257,9 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
         region.write_to_pages(start_page, &data);
         region.unlock_page_mutex().unwrap();
 
+        let put_cmd = if force { "PUT_FORCE" } else { "PUT" };
         let cmd = format!(
-            "PUT {obj_name} {total_size} {content_type} {tags_safe} {start_page} {pages_needed}\n"
+            "{put_cmd} {obj_name} {total_size} {content_type} {tags_safe} {start_page} {pages_needed}\n"
         );
         let resp = socket_cmd(&cli.socket, &cmd);
         print!("{resp}");
@@ -256,7 +267,7 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
         // 否则并发场景下其他客户端可能已重新分配该页，导致竞态损坏。
     } else {
         // 大文件：分块传输
-        log_chunked_upload(&cli.socket, &region, &obj_name, &data, content_type, &tags_safe);
+        log_chunked_upload(&cli.socket, &region, &obj_name, &data, content_type, &tags_safe, force);
     }
 
     drop(region);
@@ -270,6 +281,7 @@ fn log_chunked_upload(
     data: &[u8],
     content_type: &str,
     tags: &str,
+    force: bool,
 ) {
     let total_size = data.len();
     let total_pages = region.header().total_pages as usize;
@@ -338,8 +350,9 @@ fn log_chunked_upload(
     }
     eprintln!();
 
-    // 3. PUT_END
-    let resp = socket_cmd(socket_path, &format!("PUT_END {name}\n"));
+    // 3. PUT_END（或 PUT_END_FORCE）
+    let end_cmd = if force { "PUT_END_FORCE" } else { "PUT_END" };
+    let resp = socket_cmd(socket_path, &format!("{end_cmd} {name}\n"));
     print!("{resp}");
 }
 
@@ -389,6 +402,12 @@ fn cmd_get(cli: &Cli, id: &str, output: &Option<PathBuf>) {
     } else {
         std::io::stdout().write_all(&data).unwrap();
     }
+}
+
+fn cmd_info(cli: &Cli, id: &str) {
+    let cmd = format!("INFO {id}\n");
+    let resp = socket_cmd(&cli.socket, &cmd);
+    print!("{resp}");
 }
 
 fn cmd_delete(cli: &Cli, uuid: &str) {
