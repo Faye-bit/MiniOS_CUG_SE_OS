@@ -5,13 +5,20 @@
 //! ## 处理流程
 //!
 //! 1. **启动阶段**：解析参数 → 守护进程化（可选）→ 打开/创建 store.odb →
-//!    创建共享内存 → 初始化缓存 → 绑定 Socket → 进入事件循环
-//! 2. **请求处理**：accept 连接 → 创建线程 → 读取命令文本 → 分发处理 →
-//!    返回响应 → 关闭连接 → 线程结束
-//! 3. **关闭阶段**：收到停止信号 → 停止 accept → 等待活跃线程结束 →
-//!    刷新存储 → 清理共享内存 → 删除 PID 文件
+//!    创建共享内存 → 初始化缓存 → 启动 MPMC 工作线程池 → 启动 Prometheus HTTP
+//!    端点 → 绑定 Socket → 进入事件循环
+//! 2. **请求处理**（MPMC 模型）：
+//!    - 生产者（主 accept 循环）：accept 连接 → 读取命令 →
+//!      打包为 `WorkItem::Command` → 推入 crossbeam bounded channel →
+//!      继续 accept 下一连接
+//!    - 消费者（固定数量工作线程）：从 channel 拉取 `WorkItem` →
+//!      `dispatch_command` 处理 → 写回 socket 响应 → 循环等待下一任务
+//! 3. **关闭阶段**：收到停止信号 → 停止 accept → 向每个工作线程发送
+//!    `WorkItem::Shutdown` → Join 所有工作线程 → 刷新存储 → 清理共享内存 →
+//!    删除 PID 文件
 
 use clap::Parser;
+use crossbeam::channel::{self, Sender};
 use minios_lib::cache::lru::LruCache;
 use minios_lib::common::consts;
 use minios_lib::daemon;
@@ -83,6 +90,10 @@ struct Args {
     /// Prometheus 指标 HTTP 端口（默认 9090，设为 0 禁用）
     #[arg(long, default_value_t = 9090u16)]
     metrics_port: u16,
+
+    /// 工作线程池大小（默认 4）
+    #[arg(long, default_value_t = 4usize)]
+    worker_threads: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -138,6 +149,27 @@ struct ServerState {
 /// - `Arc` = Atomic Reference Counting（原子引用计数）
 /// - `Mutex` = Mutual Exclusion（互斥锁）
 type SharedState = Arc<Mutex<ServerState>>;
+
+// ═══════════════════════════════════════════════════════════════════════
+// 多生产者-多消费者工作项
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 工作队列中的任务项。
+///
+/// 每个客户端连接被打包为一个 `Command` 任务，
+/// 包含 UnixSocket 流和已解析的命令文本。
+/// `Shutdown` 标记用于在关闭时通知工作线程退出。
+enum WorkItem {
+    /// 来自客户端的命令请求
+    Command {
+        /// Unix Domain Socket 连接（用于写回响应）
+        stream: UnixStream,
+        /// 已解析的命令文本（例如 "PUT name size ..."）
+        command: String,
+    },
+    /// 关闭信号——每个工作线程收到此信号后退出循环
+    Shutdown,
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // 主函数 — 服务端生命周期
@@ -333,24 +365,49 @@ fn main() {
     let active_clients = Arc::new(AtomicU32::new(0));
     let max_clients = args.max_clients;
 
+    // ── 创建 MPMC 工作队列 ──
+    // crossbeam::channel 是一个多生产者-多消费者无界/有界通道。
+    // 主 accept 循环作为生产者，将客户端命令推入队列；
+    // 固定数量的工作线程作为消费者，从队列拉取并处理命令。
+    // 队列容量设为 max_clients × 2，提供适度缓冲。
+    let (work_tx, work_rx) = channel::bounded::<WorkItem>(max_clients as usize * 2);
+    let work_tx: Arc<Sender<WorkItem>> = Arc::new(work_tx);
+
+    // ── 启动工作线程池 ──
+    let num_workers = args.worker_threads.max(1);
+    let mut worker_handles = Vec::with_capacity(num_workers);
+
+    for worker_id in 0..num_workers {
+        let rx = work_rx.clone();
+        let state = Arc::clone(&state);
+        let active_clients = Arc::clone(&active_clients);
+
+        let handle = std::thread::Builder::new()
+            .name(format!("minios-worker-{worker_id}"))
+            .spawn(move || {
+                worker_loop(rx, state, active_clients);
+            })
+            .expect("spawn worker thread");
+        worker_handles.push(handle);
+    }
+    log::info!("Worker pool started: {num_workers} threads, queue capacity={}", max_clients * 2);
+
     // 设置 listener 为非阻塞模式
     // 这样 accept() 不会阻塞，我们可以定期检查 shutdown 信号
     listener.set_nonblocking(true).expect("set nonblocking");
 
-    // ── 主事件循环 ──
+    // ── 主事件循环（accept + push）──
     loop {
         // 检查是否收到关闭信号（SIGTERM / SIGINT / STOP 命令）
         if daemon::is_shutdown_requested() {
-            log::info!("Shutdown signal received, exiting...");
+            log::info!("Shutdown signal received, exiting accept loop...");
             break;
         }
 
         // 尝试接受新连接（非阻塞）
         match listener.accept() {
-            Ok((stream, addr)) => {
+            Ok((mut stream, addr)) => {
                 // ── 连接数控制 ──
-                // fetch_update 是原子的"CAS"操作：
-                // 如果当前连接数 < max_clients，则 +1 并接受，否则拒绝
                 let accepted = active_clients
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                         (current < max_clients).then_some(current + 1)
@@ -358,22 +415,30 @@ fn main() {
                     .is_ok();
 
                 if !accepted {
-                    // 超出最大连接数：拒绝连接
                     let current = active_clients.load(Ordering::SeqCst);
                     log::warn!(
                         "Rejecting connection from {:?}: server busy ({}/{})",
                         addr, current, max_clients
                     );
-                    let mut stream = stream;
                     let _ = stream.write_all(b"ERROR server busy\n");
-                    continue; // 跳过，继续循环
+                    continue;
                 }
 
-                // ── 创建客户端处理线程 ──
-                let state = Arc::clone(&state); // 增加引用计数
-                let active_clients = Arc::clone(&active_clients);
+                // ── 从 socket 读取命令文本 ──
+                let mut buf = [0u8; 4096];
+                let n = match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        // 读取失败或连接关闭 → 回退计数
+                        active_clients.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                };
 
-                // 记录新接受的连接
+                let msg = String::from_utf8_lossy(&buf[..n]);
+                let command = msg.trim().to_string();
+
+                // ── 更新指标 ──
                 {
                     let s = state.lock().unwrap();
                     s.metrics.connections_total.inc();
@@ -382,16 +447,31 @@ fn main() {
                     );
                 }
 
-                std::thread::spawn(move || {
-                    // 在线程中处理客户端请求
-                    handle_client(stream, &state);
-
-                    // 处理完毕，减少活跃客户端计数并更新 gauge
-                    let remaining = active_clients.fetch_sub(1, Ordering::SeqCst) - 1;
-                    if let Ok(s) = state.lock() {
-                        s.metrics.active_connections.set(remaining as f64);
+                // ── 推入 MPMC 工作队列 ──
+                // try_send 非阻塞：如果队列已满，拒绝连接
+                match work_tx.try_send(WorkItem::Command { stream, command }) {
+                    Ok(()) => {} // 成功入队
+                    Err(crossbeam::channel::TrySendError::Full(item)) => {
+                        // 队列满 → 拒绝连接
+                        let current = active_clients.load(Ordering::SeqCst);
+                        log::warn!(
+                            "Rejecting connection from {:?}: work queue full ({}/{})",
+                            addr, current, max_clients
+                        );
+                        let mut s = match item {
+                            WorkItem::Command { stream, .. } => stream,
+                            WorkItem::Shutdown => unreachable!(),
+                        };
+                        let _ = s.write_all(b"ERROR server busy\n");
+                        active_clients.fetch_sub(1, Ordering::SeqCst);
                     }
-                });
+                    Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                        // 通道已关闭（所有接收端已丢弃）
+                        log::error!("Work queue disconnected, exiting...");
+                        active_clients.fetch_sub(1, Ordering::SeqCst);
+                        break;
+                    }
+                }
             }
             // 非阻塞模式下没有连接时返回 WouldBlock，正常情况
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -402,8 +482,7 @@ fn main() {
             }
         }
 
-        // 休眠 50ms 避免忙等待（非阻塞模式下会立即返回 WouldBlock）
-        // 如果没有这个 sleep，CPU 占用率会是 100%
+        // 休眠 50ms 避免忙等待
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -416,27 +495,34 @@ fn main() {
     // 关闭 listener（不再接受新连接）
     drop(listener);
 
-    // 短暂等待活跃的工作线程完成正在处理的请求
-    std::thread::sleep(Duration::from_millis(200));
+    // 向每个工作线程发送 Shutdown 信号
+    for _ in 0..num_workers {
+        // 忽略发送错误（可能已有 worker 崩溃导致通道关闭）
+        let _ = work_tx.send(WorkItem::Shutdown);
+    }
+
+    // 等待所有工作线程退出
+    log::info!("Waiting for {} worker threads to finish...", num_workers);
+    for handle in worker_handles {
+        if let Err(e) = handle.join() {
+            log::error!("Worker thread panicked: {:?}", e);
+        }
+    }
+    log::info!("All worker threads finished.");
 
     // 尝试获取独占所有权并清理资源
-    // try_unwrap 只有在所有 Arc 引用都已释放时才成功
     match Arc::try_unwrap(state) {
         Ok(mutex) => {
-            // 所有其他线程已释放引用 → 可以安全清理
             let mut inner = mutex.into_inner().unwrap();
-            inner.store.flush().ok(); // 确保所有数据已写入磁盘
-            let _ = inner.region.destroy(); // 销毁共享内存
+            inner.store.flush().ok();
+            let _ = inner.region.destroy();
             log::info!("Store flushed and shared memory destroyed.");
         }
         Err(arc) => {
-            // 仍有活跃线程持有引用 → 尽力清理
-            log::warn!("Some client threads still active, forcing cleanup...");
+            log::warn!("Some references still active, forcing cleanup...");
             if let Ok(mut inner) = arc.lock() {
-                inner.store.flush().ok(); // 至少确保数据刷新
+                inner.store.flush().ok();
             }
-            // 注意：此时无法安全 destroy region（其他线程可能仍在使用）
-            // 但进程退出后内核会自动回收共享内存
         }
     }
 
@@ -449,38 +535,84 @@ fn main() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Socket 客户端处理
+// 工作线程池 — 多生产者-多消费者模型
 // ═══════════════════════════════════════════════════════════════════════
 
-/// 处理单个客户端连接
+/// 工作线程主循环。
 ///
-/// ## 流程
-/// 1. 从 socket 读取命令文本（最多 4096 字节）
-/// 2. 调用 dispatch_command 解析并执行命令
-/// 3. 将响应写回 socket
+/// 从 MPMC 通道中拉取 `WorkItem`：
+/// - `Command { stream, command }` → 调用 `dispatch_command` 处理 →
+///   将响应写回 socket → 递减活跃连接计数
+/// - `Shutdown` → 退出循环
 ///
-/// 处理完成后线程自动结束。
+/// 多个工作线程共享同一个 `Receiver`（通过 `crossbeam::channel` 的 MPMC 语义），
+/// 主 accept 循环作为生产者，工作线程池作为消费者，构成了完整的多生产者-多消费者模型。
+fn worker_loop(
+    rx: crossbeam::channel::Receiver<WorkItem>,
+    state: SharedState,
+    active_clients: Arc<AtomicU32>,
+) {
+    loop {
+        match rx.recv() {
+            Ok(WorkItem::Command {
+                mut stream,
+                command,
+            }) => {
+                // 处理命令（在 State 锁内执行）
+                let response = dispatch_command(&command, &state);
+
+                // 请求计数 +1 并快照最新指标
+                {
+                    let server_state = state.lock().unwrap();
+                    server_state.metrics.requests_total.inc();
+                    snapshot_metrics(&server_state);
+                }
+
+                // 写回响应
+                let _ = stream.write_all(response.as_bytes());
+
+                // 递减活跃客户端计数并更新 gauge
+                let remaining = active_clients.fetch_sub(1, Ordering::SeqCst) - 1;
+                if let Ok(s) = state.lock() {
+                    s.metrics.active_connections.set(remaining as f64);
+                }
+            }
+            Ok(WorkItem::Shutdown) => {
+                log::debug!(
+                    "Worker {:?} received shutdown signal",
+                    std::thread::current().name()
+                );
+                break;
+            }
+            Err(_) => {
+                // 通道已关闭（所有生产者已释放 Sender）
+                break;
+            }
+        }
+    }
+}
+
+/// 处理单个客户端连接（保留接口兼容性，当前未使用）。
+///
+/// 迁移至 MPMC 模型后，命令读取（socket read）在 accept 循环中完成，
+/// 命令执行在工作线程中完成。此函数保留以备将来直接调用（如测试）。
+#[allow(dead_code)]
 fn handle_client(mut stream: UnixStream, state: &SharedState) {
-    // 缓冲区大小 4096：足够容纳最长命令（PUT 最多约 256 字节 + 参数）
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf) {
         Ok(n) if n > 0 => n,
-        _ => return, // 读取失败或连接关闭
+        _ => return,
     };
 
-    // 将字节转为 UTF-8 字符串（无效字节用 � 替换）
     let msg = String::from_utf8_lossy(&buf[..n]);
-    // 去除尾部换行符和空白后分发处理
     let response = dispatch_command(msg.trim(), state);
 
-    // 请求计数 +1 并快照最新指标
     {
         let server_state = state.lock().unwrap();
         server_state.metrics.requests_total.inc();
         snapshot_metrics(&server_state);
     }
 
-    // 写回响应（忽略写入错误——客户端可能已断开连接）
     let _ = stream.write_all(response.as_bytes());
 }
 

@@ -650,6 +650,94 @@ flowchart LR
 `minios start` 非 daemon 模式时会将服务端 stdout/stderr 重定向到日志文件；
 daemon 模式下服务端自行 double-fork 并写入 PID 文件。
 
+### 5.6 多生产者-多消费者工作模型
+
+服务端采用 **MPMC（Multi-Producer Multi-Consumer）** 模型处理客户端请求。
+使用 `crossbeam::channel`（有界通道）实现真正的多生产者-多消费者并发：
+
+```mermaid
+flowchart LR
+    subgraph "生产者（主 accept 循环）"
+        ACCEPT["accept 连接"]
+        READ["read 命令文本"]
+        PUSH["打包 WorkItem"]
+        METRICS["更新连接指标"]
+    end
+
+    subgraph "MPMC 有界通道"
+        QUEUE["crossbeam::channel::bounded(N)"]
+    end
+
+    subgraph "消费者（固定数量工作线程）"
+        W1["Worker 1"]
+        W2["Worker 2"]
+        W3["Worker ..."]
+        W4["Worker N"]
+    end
+
+    ACCEPT --> READ --> PUSH --> METRICS --> QUEUE
+    QUEUE --> W1
+    QUEUE --> W2
+    QUEUE --> W3
+    QUEUE --> W4
+    W1 -->|"dispatch_command → write response"| SOCKET["Unix Socket"]
+    W2 --> SOCKET
+    W3 --> SOCKET
+    W4 --> SOCKET
+```
+
+**关键设计**：
+
+| 组件 | 类型 | 说明 |
+|------|------|------|
+| 工作队列 | `crossbeam::channel::bounded(WorkItem)` | 有界 MPMC 通道，容量 = max_clients × 2 |
+| 生产者 | 主 accept 循环 | 读取命令后通过 `try_send()` 非阻塞推入队列 |
+| 消费者 | 固定数量工作线程 | 从队列拉取 `WorkItem`，处理后写回 socket |
+| 工作项 | `WorkItem` 枚举 | 包含 `Command { stream, command }` 和 `Shutdown` 两种变体 |
+| 连接数限制 | `AtomicU32` CAS | 生产者推入前检查，消费者完成时递减 |
+| 背压 | `try_send` 满时返回 `Full` 错误 | 拒绝新连接，返回 `ERROR server busy` |
+| 优雅关闭 | `WorkItem::Shutdown` | 向每个工作线程发送一个关闭令牌，然后 join |
+
+**与旧模型的对比**：
+
+| 方面 | 旧模型（每连接一线程） | 新模型（MPMC 线程池） |
+|------|----------------------|----------------------|
+| 线程数量 | 无上限（受 max_clients 限制） | 固定（`--worker-threads`，默认 4） |
+| 线程创建/销毁 | 每个请求一次 spawn/kill | 线程常驻，启动时创建、关闭时退出 |
+| 工作调度 | OS 直接调度 spawn 的线程 | 通过 bounded channel 显式排队 |
+| 生产者-消费者 | 无显式分离 | 明确的生产者（accept）和消费者（workers） |
+| 请求隔离 | 完全隔离（每个线程独立） | 工作线程间共享 State |
+
+**工作线程生命周期**：
+
+1. 启动时创建 N 个工作线程，每个绑定 `Receiver` 和 `Arc<ServerState>`
+2. 工作线程循环 `rx.recv()`
+3. 收到 `Command` → `dispatch_command()` → `stream.write_all()` → 递减 `active_clients`
+4. 收到 `Shutdown` → 退出循环
+5. 通道关闭 → 退出循环
+
+**WorkItem 定义**（`minios-server/src/main.rs`）：
+
+```rust
+enum WorkItem {
+    Command {
+        stream: UnixStream,
+        command: String,
+    },
+    Shutdown,
+}
+```
+
+**启动选项**：
+
+```bash
+# 默认 4 个工作线程
+minios-server --store-path ./store.odb &
+
+# 自定义工作线程数
+minios-server --store-path ./store.odb --worker-threads 8 &
+```
+
 ---
 
 ## 6. 守护进程管理
@@ -921,7 +1009,7 @@ graph TD
 | crate | 主要依赖 |
 |-------|----------|
 | `minios-lib` | `uuid` (v4), `thiserror`, `log`, `libc`, `prometheus` |
-| `minios-server` | `minios-lib`, `clap` (derive), `log`, `env_logger`, `libc` |
+| `minios-server` | `minios-lib`, `clap` (derive), `crossbeam`, `log`, `env_logger`, `libc` |
 | `minios-client` | `minios-lib`, `clap` (derive), `libc` |
 
 ---
@@ -970,6 +1058,8 @@ classDiagram
 
 `ServerState` 由 `Arc<Mutex<ServerState>>` 包裹，所有工作线程共享同一份状态。
 每个请求处理期间持有锁，保证操作原子性。
+
+工作线程池通过 `crossbeam::channel` 实现多生产者-多消费者调度（详见 5.6 节）。
 
 ---
 

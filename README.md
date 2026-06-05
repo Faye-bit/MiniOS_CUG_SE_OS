@@ -89,6 +89,8 @@ kill $(cat /tmp/minios.pid)
 | `--max-objects` | `1024` | 最大对象数 |
 | `--total-blocks` | `4096` | 数据块总数 (每个 4KB) |
 | `--max-clients` | `16` | 最大并发客户端数 |
+| `--worker-threads` | `4` | 工作线程池大小（MPMC 消费者数量） |
+| `--metrics-port` | `9090` | Prometheus 指标 HTTP 端口（设为 0 禁用） |
 | `--daemon` | `false` | 以守护进程方式运行 |
 | `--pidfile` | `/tmp/minios.pid` | PID 文件路径 |
 
@@ -398,7 +400,7 @@ echo "=== 并发上传完成 ==="
 # => 10
 ```
 
-**并发安全机制**: 多个客户端进程通过共享内存传输数据，使用 `pthread_mutex_t`（`PTHREAD_PROCESS_SHARED`）保护页分配位图的并发访问。客户端在持有锁期间完成页分配和数据写入，释放锁后再发送 socket 命令，避免死锁。页由服务端处理请求时释放，客户端不重复释放，防止并发竞态。
+**并发安全机制**: 服务端采用 MPMC（多生产者-多消费者）模型处理请求：主 accept 循环作为生产者将命令推入 `crossbeam::channel` 有界通道，固定数量的工作线程作为消费者从通道拉取并处理。多个客户端进程通过共享内存传输数据，使用 `pthread_mutex_t`（`PTHREAD_PROCESS_SHARED`）保护页分配位图的并发访问。客户端在持有锁期间完成页分配和数据写入，释放锁后再发送 socket 命令，避免死锁。页由服务端处理请求时释放，客户端不重复释放，防止并发竞态。
 
 ### 9. 缓存命中率验证 — 命中与未命中的完整展示
 
@@ -657,6 +659,8 @@ MiniOS/
 │       │   └── page.rs         # First-Fit 页分配器
 │       ├── cache/          # LRU 缓存
 │       │   └── lru.rs
+│       ├── metrics/        # Prometheus 监控指标
+│       │   └── metrics.rs
 │       ├── protocol/       # 通信协议
 │       │   ├── request.rs      # 请求槽位 (256 bytes)
 │       │   └── response.rs     # 响应槽位 (256 bytes)
@@ -681,8 +685,10 @@ MiniOS/
 | 编程语言 | Rust (edition 2021) |
 | 存储格式 | 自定义二进制文件 (store.odb)，超级块 + 位图 + 块链表 |
 | 进程间通信 | Unix Domain Socket (控制) + POSIX 共享内存 shm_open/mmap (数据) |
+| 并发模型 | MPMC（多生产者-多消费者）基于 crossbeam bounded channel + 固定线程池 |
 | 同步机制 | pthread_mutex_t (PTHREAD_PROCESS_SHARED) + POSIX 命名信号量 |
 | 内存管理 | 基于位图的 First-Fit 页分配器 |
 | 缓存策略 | LRU (HashMap + VecDeque)，条目数 + 内存双阈值 |
+| 监控接口 | Prometheus /metrics HTTP 端点（14 个指标：Gauge + Counter） |
 | 守护进程 | double-fork + setsid + PID 文件 + SIGTERM/SIGINT 信号处理 |
 | 目标平台 | Ubuntu Linux |

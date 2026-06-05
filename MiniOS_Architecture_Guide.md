@@ -57,7 +57,7 @@ graph LR
 
 ## 2. 第一部分：每个模块的内部逻辑
 
-`minios-lib` 核心库包含 6 个子模块，自底向上分别是：
+`minios-lib` 核心库包含 7 个子模块，自底向上分别是：
 
 ### 2.1 common — 公共基础模块
 
@@ -476,7 +476,21 @@ pub fn put(&mut self, id: ObjectId, data: Vec<u8>, name: String, size: u64) {
 
 ---
 
-### 2.5 protocol — 通信协议
+### 2.5 metrics — Prometheus 监控指标
+
+**文件位置**：`minios-lib/src/metrics.rs`
+
+这个模块使用 `prometheus` crate 注册了 14 个应用级指标，并通过一个极简 HTTP 服务端（`std::net::TcpListener`）在 `/metrics` 端点上以 Prometheus 文本格式暴露。
+
+**为什么需要监控？** 在生产环境中，我们需要实时了解系统的运行状态——有多少连接、缓存是否有效、存储空间还剩多少。Prometheus + Grafana 是行业标准的监控组合。
+
+`MetricsRegistry` 注册了 4 个 Counter（`connections_total`、`requests_total`、`cache_hits_total`、`cache_misses_total`、`cache_evictions_total`）和 9 个 Gauge（`active_connections`、`store_objects`、`store_blocks_free`、`store_blocks_total`、`store_file_size_bytes`、`cache_entries`、`shm_pages_free`、`shm_pages_total`），外加一个动态计算的 `uptime_seconds`。
+
+指标更新发生在每次请求处理之后（`snapshot_metrics()`），HTTP 线程独立于请求处理线程运行，互不干扰。
+
+---
+
+### 2.6 protocol — 通信协议
 
 **文件位置**：`minios-lib/src/protocol/`
 
@@ -505,7 +519,7 @@ pub fn put(&mut self, id: ObjectId, data: Vec<u8>, name: String, size: u64) {
 
 ---
 
-### 2.6 daemon — 守护进程
+### 2.7 daemon — 守护进程
 
 **文件位置**：`minios-lib/src/daemon/mod.rs`
 
@@ -572,6 +586,7 @@ graph TD
         PAGE["shm::page<br/>PageAllocator"]
         SYNC["shm::sync<br/>ShmMutex / ShmSemaphore"]
         CACHE["cache::lru<br/>LruCache"]
+        METRICS["metrics<br/>MetricsRegistry"]
         PROTOCOL["protocol<br/>ShmRequest / ShmResponse"]
         DAEMON["daemon<br/>信号 + double-fork"]
         COMMON["common<br/>consts / types / error"]
@@ -581,6 +596,7 @@ graph TD
     SRV --> REGION
     SRV --> PAGE
     SRV --> CACHE
+    SRV --> METRICS
     SRV --> DAEMON
     CLI --> REGION
     CLI --> PAGE
@@ -589,6 +605,7 @@ graph TD
     ENGINE --> METADATA
     REGION --> SYNC
     CACHE --> COMMON
+    METRICS --> COMMON
     ENGINE --> COMMON
     SYNC --> COMMON
     PAGE --> COMMON
@@ -607,6 +624,7 @@ struct ServerState {
     region: ShmRegion,                           // 共享内存区域
     page_alloc: PageAllocator,                   // 页分配器
     pending_uploads: HashMap<String, PendingUpload>,  // 分块上传缓冲
+    metrics: MetricsRegistry,                    // Prometheus 指标
 }
 ```
 
@@ -619,14 +637,51 @@ type SharedState = Arc<Mutex<ServerState>>;
 - `Arc`（原子引用计数）：允许多个线程共同持有所有权
 - `Mutex`（互斥锁）：保证同一时刻只有一个线程访问状态
 
-### 3.3 三层锁机制
+### 3.3 四层并发机制
 
-系统的同步分为三个层级：
+系统的同步分为四个层级：
 
 ```
-层级 1: Arc<Mutex<ServerState>>   ← 保护服务端全局状态
-层级 2: ShmMutex (page_mutex)     ← 保护共享内存页分配位图
-层级 3: AtomicU32 (active_clients) ← 保护客户端连接计数
+层级 1: crossbeam MPMC channel    ← 多生产者-多消费者任务调度
+层级 2: Arc<Mutex<ServerState>>   ← 保护服务端全局状态
+层级 3: ShmMutex (page_mutex)     ← 保护共享内存页分配位图
+层级 4: AtomicU32 (active_clients) ← 保护客户端连接计数
+```
+
+**MPMC 工作模型**：
+
+服务端采用真正的多生产者-多消费者模型，替代原来的"每连接一线程"模式：
+
+- **生产者**（主 accept 循环）：接受连接 → 读取命令文本 → 打包为 `WorkItem` → 通过 `crossbeam::channel::try_send()` 推入有界通道
+- **消费者**（固定数量工作线程，默认 4 个）：从通道 `recv()` → `dispatch_command()` 处理 → 写回 socket → 递减连接计数
+- **有界通道**：容量 = `max_clients × 2`，队列满时通过 `try_send` 返回 `Full` 错误拒绝连接，提供自然的背压机制
+- **优雅关闭**：向每个工作线程发送 `WorkItem::Shutdown` 令牌，join 所有线程后清理资源
+
+```mermaid
+flowchart LR
+    subgraph "生产者（主 accept 循环）"
+        ACCEPT["accept 连接"]
+        READ["read 命令"]
+        PUSH["try_send 推入通道"]
+    end
+
+    subgraph "MPMC 有界通道"
+        QUEUE["crossbeam::channel::bounded"]
+    end
+
+    subgraph "消费者（固定线程池）"
+        W1["Worker 0"]
+        W2["Worker 1"]
+        W3["Worker N"]
+    end
+
+    ACCEPT --> READ --> PUSH --> QUEUE
+    QUEUE --> W1
+    QUEUE --> W2
+    QUEUE --> W3
+    W1 -->|"响应"| SOCKET["Unix Socket"]
+    W2 --> SOCKET
+    W3 --> SOCKET
 ```
 
 **锁的获取顺序始终是**：先获取 `ServerState` 锁，再获取 `page_mutex`。这种固定的锁顺序避免了死锁。
@@ -641,15 +696,20 @@ type SharedState = Arc<Mutex<ServerState>>;
   ShmRegion::write_to_pages()   → 共享内存数据页
   UnixStream::write_all()       → 命令通过 socket 发送
 
-服务端（命令接收后）：
-  ShmRegion::read_from_pages()  → 从共享内存读取数据
-  PageAllocator::free_pages()   → 释放共享内存页
-  ObjectStore::put()            → 调用存储引擎
-    ├── BlockBitmap::allocate_multi()   → 分配数据块
-    ├── write_data_block() × N          → 写数据块 + next 指针
-    ├── MetadataEntry::new()            → 创建元数据
-    └── flush_bitmap() + flush_superblock()  → 持久化
-  LruCache::put()               → 放入缓存
+服务端（MPMC 模型）：
+  main accept loop              → read socket → 打包 WorkItem
+  crossbeam channel             → try_send(WorkItem)（生产者 → 消费者）
+  worker thread                 → recv(WorkItem) → dispatch_command()
+    ShmRegion::read_from_pages()  → 从共享内存读取数据
+    PageAllocator::free_pages()   → 释放共享内存页
+    ObjectStore::put()            → 调用存储引擎
+      ├── BlockBitmap::allocate_multi()   → 分配数据块
+      ├── write_data_block() × N          → 写数据块 + next 指针
+      ├── MetadataEntry::new()            → 创建元数据
+      └── flush_bitmap() + flush_superblock()  → 持久化
+    LruCache::put()               → 放入缓存
+    snapshot_metrics()            → 更新 Prometheus 指标
+  worker → socket                → 写回 "OK <uuid>"
 ```
 
 ---
@@ -681,8 +741,12 @@ sequenceDiagram
     SRV->>SRV: 缓存预热（遍历活跃对象，加载到 LRU 缓存）
     SRV->>SHM: ShmRegion::create() 创建共享内存
     SRV->>SHM: 初始化页位图为全 1（空闲）
+    SRV->>SRV: 创建 MetricsRegistry（Prometheus 指标）
+    SRV->>SRV: 创建 MPMC 有界通道 (crossbeam::channel::bounded)
+    SRV->>SRV: 启动 N 个常驻工作线程（MPMC 消费者）
+    SRV->>SRV: 启动 Prometheus HTTP 端点线程
     SRV->>SOCK: UnixListener::bind() 绑定 socket
-    SRV->>SRV: 进入事件循环，等待客户端连接
+    SRV->>SRV: 进入 accept 事件循环（MPMC 生产者）
 
     Note over User,SOCK: === 运行阶段（见 4.2-4.4） ===
 
@@ -807,39 +871,59 @@ region.unlock_page_mutex();
 
 GET 操作的**页释放由客户端负责**（与 PUT 相反），因为数据流向是 服务端→客户端。
 
-### 4.5 并发控制全景
+### 4.5 并发控制全景（MPMC 模型）
 
 ```mermaid
 sequenceDiagram
+    participant MAIN as 主 accept 循环（生产者）
+    participant CHAN as MPMC 通道
+    participant W1 as Worker 0（消费者）
+    participant W2 as Worker 1（消费者）
     participant C1 as 客户端 A
     participant C2 as 客户端 B
     participant MUTEX as 页互斥锁
     participant SHM as 共享内存
-    participant SRV as 服务端（多线程）
 
-    Note over C1,SRV: 场景：两个客户端同时上传文件
+    Note over C1,SHM: 场景：两个客户端同时上传文件
 
-    C1->>MUTEX: lock() ✓ (A 获取锁)
-    C2->>MUTEX: lock() 阻塞等待...
-    C1->>SHM: alloc_pages(2) → pages 0,1
-    C1->>SHM: write_to_pages(0, data_A)
-    C1->>MUTEX: unlock() (A 释放锁)
-    C2->>MUTEX: lock() ✓ (B 获取锁)
-    C1->>SRV: PUT name_A ... 0 2 (发送socket命令)
+    C1->>MAIN: socket 连接 + 发送命令
+    C2->>MAIN: socket 连接 + 发送命令
 
-    C2->>SHM: alloc_pages(2) → pages 2,3
-    C2->>SHM: write_to_pages(2, data_B)
-    C2->>MUTEX: unlock()
-    C2->>SRV: PUT name_B ... 2 2
+    MAIN->>MAIN: 读取命令，打包 WorkItem
+    MAIN->>MAIN: read command_A
+    MAIN->>CHAN: try_send(Command { socket_A, "PUT ..." })
+    MAIN->>MAIN: read command_B
+    MAIN->>CHAN: try_send(Command { socket_B, "PUT ..." })
 
-    SRV->>SRV: [线程1] lock(ServerState) → lock(page) → read(0, data_A) → free(0,2) → unlock(page) → store.put(A) → unlock(ServerState)
-    SRV->>SRV: [线程2] lock(ServerState) → lock(page) → read(2, data_B) → free(2,2) → unlock(page) → store.put(B) → unlock(ServerState)
+    CHAN-->>W1: recv() → socket_A 的 PUT 命令
+    CHAN-->>W2: recv() → socket_B 的 PUT 命令
+
+    W1->>W1: lock(ServerState)
+    W2->>W2: 等待 ServerState 锁...
+
+    W1->>MUTEX: lock(page_mutex)
+    W1->>SHM: read_from_pages(0, data_A)
+    W1->>SHM: free_pages(0, 2)
+    W1->>MUTEX: unlock(page_mutex)
+    W1->>W1: store.put(A)
+    W1->>W1: unlock(ServerState)
+    W1->>C1: socket 写回 "OK <uuid_A>"
+
+    W2->>W2: lock(ServerState)
+    W2->>MUTEX: lock(page_mutex)
+    W2->>SHM: read_from_pages(2, data_B)
+    W2->>SHM: free_pages(2, 2)
+    W2->>MUTEX: unlock(page_mutex)
+    W2->>W2: store.put(B)
+    W2->>W2: unlock(ServerState)
+    W2->>C2: socket 写回 "OK <uuid_B>"
 ```
 
 **为什么不会死锁？** 因为：
 1. 客户端只持有 `page_mutex`，不持有 `ServerState` 锁
 2. 客户端在发送 socket 命令**之前**释放了 `page_mutex`
 3. 服务端固定的锁顺序：`ServerState` → `page_mutex`
+4. MPMC 通道解耦了连接接受和命令处理，各工作线程独立运行
 
 ---
 
@@ -1217,7 +1301,13 @@ for slot in 0..num_entries {
            socket 命令  │        │  共享内存数据
                     ┌──▼────────▼──┐
                     │  minios-server │
-                    │  (事件循环)    │
+                    │ (accept 循环)  │
+                    │ (MPMC 生产者)  │
+                    └──────┬───────┘
+                           │ crossbeam channel
+                    ┌──────▼───────┐
+                    │ Worker Pool  │
+                    │ (MPMC 消费者) │
                     └──┬────────┬──┘
            ┌───────────┘        └───────────┐
            │                                │
@@ -1227,11 +1317,11 @@ for slot in 0..num_entries {
     │  VecDeque   │                  │  + ShmMutex │
     └──────┬──────┘                  └─────────────┘
            │ cache miss
-    ┌──────▼──────┐
-    │ ObjectStore │
-    │ ┌─────────┐ │
-    │ │Superblock│ │
-    │ ├─────────┤ │
+    ┌──────▼──────┐     ┌────────────┐
+    │ ObjectStore │     │ Metrics    │
+    │ ┌─────────┐ │     │ Registry   │
+    │ │Superblock│ │     │ → /metrics │
+    │ ├─────────┤ │     └────────────┘
     │ │ Bitmap  │ │
     │ ├─────────┤ │
     │ │Metadata │ │
