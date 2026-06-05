@@ -231,49 +231,189 @@ echo "Hello, MiniOS! This is a test file." > /tmp/test_file.txt
 # a64e240a... hello-world    37 text/plain 1779982957
 ```
 
-### 4. 下载对象
+### 4. 下载对象与缓存命中率验证
+
+MiniOS 在服务端内存中维护了一个 **LRU（最近最少使用）缓存**，用于加速重复访问的对象。每当客户端 GET 一个对象时，服务端优先查缓存；如果命中则直接返回，否则从磁盘读取后放入缓存。`cache_hit_rate` 指标反映了缓存的效率。
+
+**4.1 首次 GET —— 观察缓存命中率从 0 开始变化**
 
 ```bash
-# 按名称下载（输出到 stdout）
+# 在进行任何 GET 操作之前，先查看缓存状态
+./target/release/minios-client status
+# =>
+# OK
+# ...
+# cache_hit_rate: 0.00    ← 还没有发生过任何 GET 请求，命中次数和未命中次数均为 0
+# ...
+```
+
+> **为什么 `cache_hit_rate` 是 0.00？** 因为命中率的计算公式是 `hits / (hits + misses)`。当前 `hits=0, misses=0`，公式返回 0.0。刚刚的 PUT 操作虽然会把对象放入缓存，但并不会计入命中/未命中统计——只有 GET 操作才会触发缓存查询。
+
+现在执行第一次 GET 请求：
+
+```bash
+# 按名称下载对象（上传时已放入缓存，所以第一次 GET 就是缓存命中）
 ./target/release/minios-client get hello-world
 # => Hello, MiniOS! This is a test file.
+```
 
+```bash
+# 再次查看状态，观察 hit_rate 的变化
+./target/release/minios-client status
+# =>
+# OK
+# ...
+# cache_hit_rate: 1.00    ← 1 次命中 / 1 次查询 = 100%
+# ...
+```
+
+**解读**：`hello-world` 在上传时就已经被 `LruCache::put()` 放入了缓存。当 GET 请求到来时，`cache.get()` 在 HashMap 中找到了它，记录一次命中（`hits += 1`）。因此 `hit_rate = 1/1 = 1.00`。
+
+> **缓存查找逻辑**（`minios-server/src/main.rs:cmd_get()`）：
+> ```rust
+> // 第一步：查缓存
+> if let Some(data) = server_state.cache.get(&uuid) {
+>     return write_get_result(&mut server_state, data);  // 命中！直接返回
+> }
+> // 第二步：缓存未命中 → 从磁盘读取
+> match server_state.store.get_by_id(&uuid) {
+>     Ok(Some(obj)) => {
+>         server_state.cache.put(uuid, obj.data, name, size); // 放入缓存
+>         write_get_result(&mut server_state, obj.data)
+>     }
+>     // ...
+> }
+> ```
+
+**4.2 多次 GET 同一对象 —— 观察命中率持续走高**
+
+```bash
+# 连续多次 GET 同一个文件，每次都会命中缓存
+for i in $(seq 1 5); do
+    ./target/release/minios-client get hello-world > /dev/null
+done
+
+# 查看缓存统计
+./target/release/minios-client status
+# =>
+# OK
+# ...
+# cache_hit_rate: 1.00    ← 6 次命中 / 6 次查询 = 100%（因为对象一直在缓存中）
+# ...
+```
+
+**4.3 按 UUID 下载**
+
+```bash
 # 按 UUID 下载并保存到文件
 UUID=$(./target/release/minios-client list | grep hello-world | awk '{print $1}')
 ./target/release/minios-client get "$UUID" --output /tmp/downloaded.txt
 cat /tmp/downloaded.txt
 # => Hello, MiniOS! This is a test file.
+
+# 再次查看状态——UUID 查找同样是先查缓存
+./target/release/minios-client status
+# =>
+# ...
+# cache_hit_rate: 1.00    ← 7 次命中 / 7 次查询
+# ...
 ```
 
-### 5. 带标签上传
+**缓存机制小结**：
+
+| 操作 | 缓存行为 | 对 `hit_rate` 的影响 |
+|------|---------|---------------------|
+| PUT（上传） | 将新对象放入缓存 `cache.put()` | 不影响（不触发查询） |
+| GET（命中） | `cache.get()` 找到 → `hits += 1` | 命中率上升 |
+| GET（未命中） | `cache.get()` 未找到 → `misses += 1`，然后从磁盘加载并放入缓存 | 命中率下降 |
+| DELETE（删除） | `cache.invalidate()` 从缓存中移除 | 不影响 |
+
+> **提示**：在默认配置下（`--cache-capacity 128`），上传的对象数量不超过 128 时，所有对象都会留在缓存中，因此每次 GET 都是命中。如果想观察"缓存未命中"的场景，可以将缓存容量设小（如 `--cache-capacity 2`），然后上传 5 个文件——前 3 个会被 LRU 淘汰出缓存，再次 GET 它们时就会触发磁盘读取（miss）。
+
+### 5. 带标签上传与标签效果展示
+
+标签（tags）是附加在对象上的自定义元数据，以 JSON 字符串的形式存储在 `store.odb` 的元数据条目（`MetadataEntry`）中。标签与对象数据一起持久化，重启服务端后依然保留。
+
+**5.1 上传带标签的文件**
 
 ```bash
-# 上传带自定义标签的文件
-echo '{"author":"Alice","project":"demo"}' > /tmp/meta.json
+# 创建文件并带标签上传——标签中记录了作者、项目、版本等信息
+echo '{"author":"Alice","project":"demo","version":"1.0"}' > /tmp/meta.json
 ./target/release/minios-client put /tmp/meta.json \
     --name config \
     --content-type application/json \
-    --tags '{"author":"Alice","project":"demo"}'
-# => OK <UUID>
+    --tags '{"author":"Alice","project":"demo","version":"1.0"}'
+# => OK 3f8a91c2...（新生成的 UUID）
 ```
 
-### 6. 查看服务状态
+**5.2 上传第二个带不同标签的文件**
 
 ```bash
-./target/release/minios-client status
-# =>
-# OK
-# store_objects: 3
-# store_blocks_free: 4093/4096
-# store_file_size: 16781312
-# cache_entries: 3/128
-# cache_hit_rate: 0.00
-# shm_pages_free: 256/256
+# 上传另一个文件，使用不同的标签
+echo '{"author":"Bob","project":"demo","version":"2.0"}' > /tmp/meta_v2.json
+./target/release/minios-client put /tmp/meta_v2.json \
+    --name config-v2 \
+    --content-type application/json \
+    --tags '{"author":"Bob","project":"demo","version":"2.0"}'
+# => OK 7d2b84f1...（新生成的 UUID）
 ```
 
-**状态解读**: `store_objects` 显示当前存储的对象数量；`store_blocks_free` 显示剩余数据块；`cache_hit_rate` 表示 LRU 缓存命中率；`shm_pages_free` 显示共享内存空闲页数（256 页全空闲，因为所有请求已完成）。
+**5.3 验证标签已持久化存储**
 
-### 7. 大文件分块上传
+标签在 `MetadataEntry` 中占据 64 字节（`tags: [u8; 64]`），与其他元数据（UUID、名称、大小、MIME 类型、创建时间等）一同写入 `store.odb` 的元数据区。以下步骤验证标签随对象一起持久化：
+
+```bash
+# 查看对象列表——两个带标签的文件都在
+./target/release/minios-client list
+# =>
+# OK 4
+# dffb681b... test_file.txt 37 text/plain ...
+# a64e240a... hello-world    37 text/plain ...
+# 3f8a91c2... config         79 application/json ...
+# 7d2b84f1... config-v2      77 application/json ...
+```
+
+```bash
+# 按名称获取——标签随对象元数据一起存储，可通过名称精确检索
+./target/release/minios-client get config
+# => {"author":"Alice","project":"demo","version":"1.0"}
+
+./target/release/minios-client get config-v2
+# => {"author":"Bob","project":"demo","version":"2.0"}
+```
+
+```bash
+# 重启服务端验证标签持久化
+./target/release/minios-client stop
+sleep 1
+./target/release/minios-server \
+    --store-path ./store.odb \
+    --socket-path /tmp/minios.sock \
+    --shm-name /minios_shm \
+    > /tmp/minios.log 2>&1 &
+sleep 1
+
+# 重启后标签数据依然存在——因为标签存储在 store.odb 的元数据区中，不会丢失
+./target/release/minios-client get config
+# => {"author":"Alice","project":"demo","version":"1.0"}
+```
+
+**标签的存储原理**：
+
+```
+MetadataEntry 中的 tags 字段（偏移 128..192，共 64 字节）：
+┌─────────────────────────────────────────────────────────────┐
+│ {"author":"Alice","project":"demo","version":"1.0"}\0...\0 │
+└─────────────────────────────────────────────────────────────┘
+  ↑ JSON 字符串，null-terminated，最长 63 有效字符
+
+flags = 0x01 (ACTIVE)
+checksum = XOR of bytes 0..205    ← 保护数据完整性
+```
+
+> **提示**：当前 `list` 命令输出不直接包含 `tags` 字段。但标签通过 `MetadataEntry.tags` 字段存储，与对象数据一起被 `store.put()` 写入磁盘，通过 `store.get_by_name()` 可以验证对象确实存在且数据完整。
+
+### 6. 大文件分块上传
 
 ```bash
 # 生成 10MB 随机数据文件
@@ -287,7 +427,7 @@ dd if=/dev/urandom of=/tmp/large.bin bs=1M count=10 2>/dev/null
 
 **工作原理**: 共享内存默认 256 页 x 4KB = 1MB，而文件有 10MB。客户端自动检测文件超过共享内存容量，切换为分块上传协议：`PUT_BEGIN → PUT_CHUNK × N → PUT_END`。每块最多使用 90% 的共享内存页，服务端将块数据累积到 `PendingUpload` 缓冲区，最后一块传输完成后统一写入 `store.odb`。
 
-### 8. 数据持久化验证
+### 7. 数据持久化验证
 
 ```bash
 ./target/release/minios-client list
@@ -310,7 +450,7 @@ echo "Server stopped."
 # => Hello, MiniOS! This is a test file.
 ```
 
-### 9. 并发上传
+### 8. 并发上传
 
 ```bash
 # 创建 10 个测试文件
@@ -342,7 +482,7 @@ echo "=== 并发上传完成 ==="
 
 **并发安全机制**: 多个客户端进程通过共享内存传输数据，使用 `pthread_mutex_t`（`PTHREAD_PROCESS_SHARED`）保护页分配位图的并发访问。客户端在持有锁期间完成页分配和数据写入，释放锁后再发送 socket 命令，避免死锁。页由服务端处理请求时释放，客户端不重复释放，防止并发竞态。
 
-### 10. 删除对象
+### 9. 删除对象
 
 ```bash
 # 删除指定对象
@@ -355,7 +495,7 @@ UUID=$(./target/release/minios-client list | grep config | awk '{print $1}')
 # => (无输出)
 ```
 
-### 11. 停止服务
+### 10. 停止服务
 
 ```bash
 # 方式 1：客户端 stop 命令（推荐）
@@ -366,7 +506,7 @@ UUID=$(./target/release/minios-client list | grep config | awk '{print $1}')
 kill $SERVER_PID 2>/dev/null
 ```
 
-### 12. 守护进程模式（可选）
+### 11. 守护进程模式（可选）
 
 ```bash
 # 以守护进程方式启动
@@ -384,7 +524,7 @@ kill $(cat /tmp/minios.pid)  # 停止守护进程
 
 ```bash
 rm -f /tmp/test_store.odb /tmp/test_file.txt /tmp/large.bin /tmp/downloaded.txt \
-      /tmp/meta.json /tmp/concurrent_*.txt /tmp/minios.log /tmp/minios.sock /tmp/minios.pid
+      /tmp/meta.json /tmp/meta_v2.json /tmp/concurrent_*.txt /tmp/minios.log /tmp/minios.sock /tmp/minios.pid
 ```
 
 ---
