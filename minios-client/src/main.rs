@@ -158,7 +158,7 @@ fn default_server_path() -> PathBuf {
 }
 
 fn cmd_stop(cli: &Cli) {
-    let resp = queue_cmd(&cli.socket, &cli.shm_name, "STOP\n");
+    let resp = queue_cmd(&cli.socket, &cli.shm_name, None, "STOP\n");
     print!("{resp}");
 }
 
@@ -179,57 +179,70 @@ fn socket_cmd(socket_path: &str, command: &str) -> String {
 
 /// 通过共享内存请求/响应队列发送命令（基于信号量的有界缓冲区）。
 ///
-/// 如果服务端启用了共享内存队列（--shm-queue-slots > 0），则使用信号量
-/// 同步的请求/响应环形缓冲区进行通信；否则自动回退到 Unix Socket。
+/// ## region 参数
+/// - `Some(&region)`: 复用调用方已打开的 ShmRegion（PUT/GET 场景），避免重复 mmap
+/// - `None`: 自行打开 ShmRegion（STATUS/LIST/INFO/DELETE/STOP 场景）
 ///
-/// ## 流程
-/// 1. 打开共享内存 → 检查队列魔数
-/// 2. 如果队列可用：push_request → pop_response
-/// 3. 如果队列不可用或出错：fallback 到 socket_cmd
-fn queue_cmd(socket_path: &str, shm_name: &str, command: &str) -> String {
-    // 尝试打开共享内存
-    let region = match ShmRegion::open(shm_name) {
-        Ok(r) => r,
-        Err(_) => return queue_cmd(socket_path, shm_name, command),
-    };
+/// 如果服务端未启用共享内存队列，或在任何步骤出错，自动回退到 Unix Socket。
+fn queue_cmd(
+    socket_path: &str,
+    shm_name: &str,
+    region: Option<&ShmRegion>,
+    command: &str,
+) -> String {
+    // 如果调用方已持有 region，直接使用它的指针和 header
+    if let Some(r) = region {
+        let ctrl_page = unsafe { r.data_area().sub(consts::SHM_PAGE_SIZE as usize) };
+        return queue_cmd_impl(socket_path, shm_name, command, ctrl_page, r.header());
+    }
 
+    // 自行打开共享内存
+    let r = match ShmRegion::open(shm_name) {
+        Ok(r) => r,
+        Err(_) => return socket_cmd(socket_path, command),
+    };
+    let ctrl_page = unsafe { r.data_area().sub(consts::SHM_PAGE_SIZE as usize) };
+    let result = queue_cmd_impl(socket_path, shm_name, command, ctrl_page, r.header());
+    drop(r);
+    result
+}
+
+/// queue_cmd 的核心实现：不负责 SHM 生命周期，仅使用裸指针和 header 快照。
+fn queue_cmd_impl(
+    socket_path: &str,
+    shm_name: &str,
+    command: &str,
+    ctrl_page: *mut u8,
+    header: &minios_lib::shm::region::ShmControlHeader,
+) -> String {
     // 检查队列是否可用（魔数 "MOSQ"）
-    let ctrl_page = unsafe { region.data_area().sub(consts::SHM_PAGE_SIZE as usize) };
-    if !ShmQueue::is_available(ctrl_page, region.header()) {
-        drop(region);
-        return queue_cmd(socket_path, shm_name, command);
+    if !ShmQueue::is_available(ctrl_page, header) {
+        return socket_cmd(socket_path, command);
     }
 
     // 打开队列（复用已有的信号量和互斥锁）
-    let queue = match ShmQueue::open(ctrl_page, region.header(), shm_name) {
+    let queue = match ShmQueue::open(ctrl_page, header, shm_name) {
         Ok(q) => q,
-        Err(_) => {
-            drop(region);
-            return queue_cmd(socket_path, shm_name, command);
-        }
+        Err(_) => return socket_cmd(socket_path, command),
     };
 
     // 发送请求（P(req_empty) → lock → write → unlock → V(req_full)）
     let client_id = std::process::id();
-    if let Err(_e) = queue.push_request(client_id, command) {
+    if queue.push_request(client_id, command).is_err() {
         let _ = queue.close();
-        drop(region);
-        return queue_cmd(socket_path, shm_name, command);
+        return socket_cmd(socket_path, command);
     }
 
     // 接收响应（P(resp_full) → lock → read → unlock → V(resp_empty)）
     let response = match queue.pop_response() {
         Ok(resp) => resp.response_str().to_string(),
-        Err(_e) => {
+        Err(_) => {
             let _ = queue.close();
-            drop(region);
-            return queue_cmd(socket_path, shm_name, command);
+            return socket_cmd(socket_path, command);
         }
     };
 
-    // 清理
     let _ = queue.close();
-    drop(region);
     response
 }
 
@@ -255,12 +268,12 @@ fn make_page_alloc(region: &ShmRegion) -> PageAllocator {
 // ─── 命令实现 ───
 
 fn cmd_status(cli: &Cli) {
-    let resp = queue_cmd(&cli.socket, &cli.shm_name, "STATUS\n");
+    let resp = queue_cmd(&cli.socket, &cli.shm_name, None, "STATUS\n");
     print!("{resp}");
 }
 
 fn cmd_list(cli: &Cli) {
-    let resp = queue_cmd(&cli.socket, &cli.shm_name, "LIST\n");
+    let resp = queue_cmd(&cli.socket, &cli.shm_name, None, "LIST\n");
     print!("{resp}");
 }
 
@@ -282,7 +295,7 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
 
     if total_size == 0 {
         let cmd = format!("PUT {obj_name} 0 {content_type} {tags_safe} 0 0\n");
-        let resp = queue_cmd(&cli.socket, &cli.shm_name, &cmd);
+        let resp = queue_cmd(&cli.socket, &cli.shm_name, None, &cmd);
         print!("{resp}");
         return;
     }
@@ -318,7 +331,7 @@ fn cmd_put(cli: &Cli, file: &PathBuf, name: &Option<String>, content_type: &str,
         let cmd = format!(
             "{put_cmd} {obj_name} {total_size} {content_type} {tags_safe} {start_page} {pages_needed}\n"
         );
-        let resp = queue_cmd(&cli.socket, &cli.shm_name, &cmd);
+        let resp = queue_cmd(&cli.socket, &cli.shm_name, Some(&region), &cmd);
         print!("{resp}");
         // 注意：页由服务端在 cmd_put 中释放，客户端不重复释放，
         // 否则并发场景下其他客户端可能已重新分配该页，导致竞态损坏。
@@ -410,13 +423,13 @@ fn log_chunked_upload(
 
     // 3. PUT_END（或 PUT_END_FORCE）
     let end_cmd = if force { "PUT_END_FORCE" } else { "PUT_END" };
-    let resp = queue_cmd(socket_path, shm_name, &format!("{end_cmd} {name}\n"));
+    let resp = queue_cmd(socket_path, shm_name, Some(region), &format!("{end_cmd} {name}\n"));
     print!("{resp}");
 }
 
 fn cmd_get(cli: &Cli, id: &str, output: &Option<PathBuf>) {
     let cmd = format!("GET {id}\n");
-    let resp = queue_cmd(&cli.socket, &cli.shm_name, &cmd);
+    let resp = queue_cmd(&cli.socket, &cli.shm_name, None, &cmd);
     let resp = resp.trim();
 
     if resp.starts_with("ERROR") {
@@ -464,12 +477,12 @@ fn cmd_get(cli: &Cli, id: &str, output: &Option<PathBuf>) {
 
 fn cmd_info(cli: &Cli, id: &str) {
     let cmd = format!("INFO {id}\n");
-    let resp = queue_cmd(&cli.socket, &cli.shm_name, &cmd);
+    let resp = queue_cmd(&cli.socket, &cli.shm_name, None, &cmd);
     print!("{resp}");
 }
 
 fn cmd_delete(cli: &Cli, uuid: &str) {
     let cmd = format!("DELETE {uuid}\n");
-    let resp = queue_cmd(&cli.socket, &cli.shm_name, &cmd);
+    let resp = queue_cmd(&cli.socket, &cli.shm_name, None, &cmd);
     print!("{resp}");
 }
