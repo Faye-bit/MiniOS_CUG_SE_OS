@@ -59,3 +59,12 @@ pub const DEFAULT_SHM_PAGES: u32 = 256;
 
 /// 默认服务端最大并发连接数
 pub const DEFAULT_MAX_CLIENTS: usize = 16;
+
+/// 共享内存请求/响应队列魔数
+pub const QUEUE_MAGIC: [u8; 4] = *b"MOSQ";
+
+/// 队列请求/响应槽位大小（字节）
+pub const QUEUE_SLOT_SIZE: u32 = 256;
+
+/// 默认队列槽位数（每个方向）
+pub const DEFAULT_QUEUE_SLOTS: u32 = 4;

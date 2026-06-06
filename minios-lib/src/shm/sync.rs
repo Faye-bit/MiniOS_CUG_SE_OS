@@ -209,6 +209,78 @@ impl ShmSemaphore {
         }
     }
 
+    /// 带超时的信号量等待（P 操作）。
+    ///
+    /// 在指定毫秒内等待信号量，超时返回 `ShmError("timeout")`。
+    /// 用于队列监听线程定期检查 shutdown 标志。
+    ///
+    /// ## 平台实现
+    /// - Linux：使用 `sem_timedwait`（高效，内核级超时）
+    /// - macOS：使用 `try_wait` 轮询（10ms 步进），macOS 不完全支持 POSIX 信号量
+    pub fn timed_wait_ms(&self, timeout_ms: u32) -> MiniosResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            // Linux：使用真正的 sem_timedwait
+            extern "C" {
+                fn sem_timedwait(
+                    sem: *mut libc::sem_t,
+                    abs_timeout: *const libc::timespec,
+                ) -> libc::c_int;
+            }
+
+            let mut now = unsafe { std::mem::zeroed::<libc::timespec>() };
+            let ret = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(MiniosError::ShmError(format!(
+                    "clock_gettime failed: {err}"
+                )));
+            }
+
+            let total_nsec = now.tv_nsec as i64 + (timeout_ms as i64) * 1_000_000;
+            let abs_sec = now.tv_sec as i64 + total_nsec / 1_000_000_000;
+            let abs_nsec = (total_nsec % 1_000_000_000) as libc::c_long;
+
+            let ts = libc::timespec {
+                tv_sec: abs_sec as libc::time_t,
+                tv_nsec: abs_nsec,
+            };
+
+            loop {
+                let ret = unsafe { sem_timedwait(self.sem, &ts) };
+                if ret == 0 {
+                    return Ok(());
+                }
+                let err = std::io::Error::last_os_error();
+                let code = err.raw_os_error();
+                if code == Some(libc::ETIMEDOUT) {
+                    return Err(MiniosError::ShmError("timeout".into()));
+                } else if code == Some(libc::EINTR) {
+                    continue;
+                } else {
+                    return Err(MiniosError::ShmError(format!(
+                        "sem_timedwait failed: {err}"
+                    )));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            // macOS 等：使用 try_wait 轮询
+            let step_ms: u32 = 10;
+            let mut elapsed: u32 = 0;
+            while elapsed < timeout_ms {
+                if self.try_wait().is_ok() {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(step_ms as u64));
+                elapsed += step_ms;
+            }
+            Err(MiniosError::ShmError("timeout".into()))
+        }
+    }
+
     /// 发送信号量（V 操作，加 1）。
     pub fn post(&self) -> MiniosResult<()> {
         let ret = unsafe { libc::sem_post(self.sem) }; // 将 sem 的值加 1，唤醒正在等待的线程/进程

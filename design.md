@@ -53,6 +53,7 @@ sequenceDiagram
     participant SRV as minios-server
     participant ENG as ObjectStore
     participant ODB as store.odb
+    participant CACHE as cache
 
     Note over User,ODB: === PUT 操作 (小文件单次传输) ===
 
@@ -76,7 +77,7 @@ sequenceDiagram
     SRV->>SOCK: 返回 "OK <uuid>\n"
     SOCK->>CLI: 显示结果
 
-    Note over User,ODB: === GET 操作 ===
+    Note over User,CACHE: === GET 操作 ===
 
     User->>CLI: minios get <uuid>
     CLI->>SOCK: 发送 "GET <uuid>\n"
@@ -446,6 +447,79 @@ sequenceDiagram
     S->>S: 处理 A: lock(state)→lock(page)→read→free(0,2)→unlock(page)→put→unlock(state)
     S->>S: 处理 B: lock(state)→lock(page)→read→free(2,2)→unlock(page)→put→unlock(state)
 ```
+
+### 3.4 请求/响应队列 — 基于信号量的有界缓冲区
+
+共享内存中实现了一个基于 **4 个 POSIX 命名信号量 + 2 个跨进程互斥锁** 的请求/响应
+环形缓冲区（有界缓冲区），用于替代 Unix Socket 传输命令文本。这是操作系统教材中
+经典的 **生产者-消费者问题（Producer-Consumer Problem）** 的完整实现。
+
+**队列在控制页中的布局**：
+
+```
+Page 0 (4096 B):
+  ShmControlHeader (28 B)
+  Page Bitmap       (变化)
+  page_mutex        (pthread_mutex_t, ~40-64 B)
+  ── 队列区（紧接 page_mutex 后）──
+  ShmQueueHeader    (32 B)  magic="MOSQ", num_slots, head/tail 索引
+  req_mutex         (pthread_mutex_t, ~40-64 B)
+  resp_mutex        (pthread_mutex_t, ~40-64 B)
+  QueueRequest[0..N-1]   (N × 256 B, 命令槽位)
+  QueueResponse[0..N-1]  (N × 256 B, 响应槽位)
+```
+
+**信号量语义**：
+
+| 信号量 | 初值 | 语义 | P(wait) | V(post) |
+|--------|------|------|---------|---------|
+| `{shm}_req_empty` | N | 请求队列空闲槽位数 | 客户端（发送前） | 服务端（取出后） |
+| `{shm}_req_full` | 0 | 请求队列就绪槽位数 | 服务端（取出前） | 客户端（发送后） |
+| `{shm}_resp_empty` | N | 响应队列空闲槽位数 | 服务端（发送前） | 客户端（取出后） |
+| `{shm}_resp_full` | 0 | 响应队列就绪槽位数 | 客户端（取出前） | 服务端（发送后） |
+
+这 4 个信号量精确对应 Dijkstra (1965) 论文中描述的有界缓冲区同步模式。
+每个信号量有明确的语义：`empty` 计数可用的"空资源"，`full` 计数可消费的"满资源"。
+
+**队列操作流程（以客户端 PUT 为例）**：
+
+```mermaid
+sequenceDiagram
+    participant CLI as 客户端
+    participant REQ as 请求队列 (信号量保护)
+    participant SRV as 队列监听线程
+    participant RESP as 响应队列 (信号量保护)
+
+    Note over CLI,RESP: 通过有界缓冲区发送命令/接收响应
+
+    CLI->>CLI: lock(page_mutex) → alloc → write data → unlock
+    CLI->>REQ: P(req_empty) 等待空槽位
+    CLI->>REQ: lock(req_mutex) → 写入 QueueRequest → unlock
+    CLI->>REQ: V(req_full) 通知有新请求
+    CLI->>RESP: P(resp_full) 等待响应
+
+    SRV->>REQ: P(req_full) 等待请求（sem_timedwait 100ms，检测 shutdown）
+    SRV->>REQ: lock(req_mutex) → 读取 → unlock
+    SRV->>REQ: V(req_empty) 释放空槽位
+    SRV->>SRV: dispatch_command() 处理命令
+    SRV->>RESP: P(resp_empty) 等待空槽位
+    SRV->>RESP: lock(resp_mutex) → 写入 QueueResponse → unlock
+    SRV->>RESP: V(resp_full) 通知响应就绪
+
+    CLI->>RESP: lock(resp_mutex) → 读取 → unlock
+    CLI->>RESP: V(resp_empty) 释放空槽位
+```
+
+**关于 FIFO 顺序**：队列监听线程是**单线程**，按请求到达顺序（`req_full` 信号量的 FIFO 唤醒语义）
+逐一处理。因此响应也按相同顺序输出，客户端不需要在响应中匹配 `client_id`——虽然
+`QueueResponse` 包含 `client_id` 字段以备将来扩展。
+
+**与 Socket 路径的关系**：共享内存队列与 Unix Socket 并行运行。客户端自动检测队列
+可用性（通过 `ShmQueueHeader` 魔数 "MOSQ"），若队列不可用则回退到 Socket。
+服务端通过 `--shm-queue-slots` 参数控制队列启用（设为 0 则禁用，完全走 Socket）。
+
+**关闭流程**：主线程在关闭时设置 `shutdown` 标志并调用 `wake_all()`（向 4 个信号量
+各 post 一次），使阻塞在 `sem_wait`/`sem_timedwait` 上的队列监听线程被唤醒并退出。
 
 ---
 

@@ -24,6 +24,7 @@ use minios_lib::common::consts;
 use minios_lib::daemon;
 use minios_lib::metrics::MetricsRegistry;
 use minios_lib::shm::page::PageAllocator;
+use minios_lib::shm::queue::ShmQueue;
 use minios_lib::shm::region::ShmRegion;
 use minios_lib::storage::engine::ObjectStore;
 use std::collections::HashMap;
@@ -31,7 +32,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -94,6 +95,10 @@ struct Args {
     /// 工作线程池大小（默认 4）
     #[arg(long, default_value_t = 4usize)]
     worker_threads: usize,
+
+    /// 共享内存请求/响应队列槽位数（默认 0 = 禁用，设为 1~7 启用）
+    #[arg(long, default_value_t = 0u32)]
+    shm_queue_slots: u32,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -320,6 +325,29 @@ fn main() {
         }
     }
 
+    // ── 初始化共享内存请求/响应队列（基于信号量的有界缓冲区）──
+    // 队列结构放置在控制页中页互斥锁之后的空闲空间。
+    // 队列作为独立 Arc 存储（不放在 ServerState 中），以便队列监听线程
+    // 在不需要持有 ServerState 锁的情况下进行 pop_request / push_response 操作。
+    let shm_queue: Option<Arc<ShmQueue>> = if args.shm_queue_slots > 0 {
+        // 计算控制页基址（data_area() 返回 Page 1 起始，回退一页即为 Page 0）
+        let ctrl_page = unsafe { region.data_area().sub(consts::SHM_PAGE_SIZE as usize) };
+        let header = region.header();
+        let num_slots = args.shm_queue_slots.min(minios_lib::shm::queue::max_slots_for(header));
+        log::info!("Initializing SHM request/response queue with {num_slots} slots...");
+        let q = ShmQueue::create(ctrl_page, header, &args.shm_name, num_slots)
+            .unwrap_or_else(|e| {
+                log::error!("Cannot create SHM queue: {e}");
+                std::process::exit(1);
+            });
+        log::info!("SHM queue created (req_empty={}, req_full=0, resp_empty={}, resp_full=0)",
+            num_slots, num_slots);
+        Some(Arc::new(q))
+    } else {
+        log::info!("SHM queue disabled (--shm-queue-slots=0)");
+        None
+    };
+
     // ── 创建 Prometheus 指标注册表 ──
     let start_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -391,6 +419,25 @@ fn main() {
         worker_handles.push(handle);
     }
     log::info!("Worker pool started: {num_workers} threads, queue capacity={}", max_clients * 2);
+
+    // ── 启动共享内存队列监听线程（如果启用）──
+    // 队列监听线程作为独立的"消费者"，从共享内存请求队列中读取命令，
+    // 调用 dispatch_command 处理，并将响应写回共享内存响应队列。
+    // 使用 sem_timedwait 定期检查 shutdown 标志，支持优雅关闭。
+    let queue_shutdown = Arc::new(AtomicBool::new(false));
+    let queue_handle = if let Some(ref q) = shm_queue {
+        let q_listener = Arc::clone(q);
+        let q_state = Arc::clone(&state);
+        let q_shutdown = Arc::clone(&queue_shutdown);
+        Some(std::thread::Builder::new()
+            .name("minios-queue-listener".into())
+            .spawn(move || {
+                queue_listener_loop(q_listener, q_state, q_shutdown);
+            })
+            .expect("spawn queue listener thread"))
+    } else {
+        None
+    };
 
     // 设置 listener 为非阻塞模式
     // 这样 accept() 不会阻塞，我们可以定期检查 shutdown 信号
@@ -492,6 +539,12 @@ fn main() {
 
     log::info!("Shutting down...");
 
+    // ── 通知队列监听线程退出 ──
+    queue_shutdown.store(true, Ordering::SeqCst);
+    if let Some(ref q) = shm_queue {
+        q.wake_all(); // post 所有信号量以解除 sem_wait/timed_wait 阻塞
+    }
+
     // 关闭 listener（不再接受新连接）
     drop(listener);
 
@@ -499,6 +552,14 @@ fn main() {
     for _ in 0..num_workers {
         // 忽略发送错误（可能已有 worker 崩溃导致通道关闭）
         let _ = work_tx.send(WorkItem::Shutdown);
+    }
+
+    // 等待队列监听线程退出
+    if let Some(handle) = queue_handle {
+        log::info!("Waiting for queue listener thread to finish...");
+        if let Err(e) = handle.join() {
+            log::error!("Queue listener thread panicked: {:?}", e);
+        }
     }
 
     // 等待所有工作线程退出
@@ -509,6 +570,20 @@ fn main() {
         }
     }
     log::info!("All worker threads finished.");
+
+    // ── 销毁共享内存队列（信号量 unlink）──
+    if let Some(q) = shm_queue {
+        match Arc::try_unwrap(q) {
+            Ok(queue) => {
+                if let Err(e) = queue.destroy() {
+                    log::warn!("Queue destroy failed (may be cleaned by OS): {e}");
+                }
+            }
+            Err(_) => {
+                log::warn!("Queue still referenced, skipping destroy (OS will clean up semaphores)");
+            }
+        }
+    }
 
     // 尝试获取独占所有权并清理资源
     match Arc::try_unwrap(state) {
@@ -590,6 +665,76 @@ fn worker_loop(
             }
         }
     }
+}
+
+/// 共享内存队列监听线程主循环（基于信号量的生产者-消费者模式）。
+///
+/// 从共享内存请求队列中 pop 客户端命令（消费者），
+/// 调用 dispatch_command 处理，将响应 push 回共享内存响应队列（生产者）。
+///
+/// ## 同步设计
+/// - 使用 `pop_request(timeout_ms)` 在 `req_full` 信号量上阻塞等待，
+///   每 100ms 超时检查 shutdown 标志
+/// - `pop_request` 和 `push_response` 不持有 ServerState 锁，
+///   仅使用队列内部的跨进程互斥锁
+/// - `dispatch_command` 内部自行获取 ServerState 锁
+///
+/// ## 关闭
+/// 主线程在关闭时设置 `shutdown` 为 true 并调用 `wake_all()`，
+/// 使 `pop_request` 中的 `sem_timedwait` 被唤醒或超时触发退出。
+fn queue_listener_loop(
+    queue: Arc<ShmQueue>,
+    state: SharedState,
+    shutdown: Arc<AtomicBool>,
+) {
+    log::info!("Queue listener thread started ({} slots)", queue.slot_count());
+
+    loop {
+        // 从请求队列取出命令（100ms 超时，定期检查 shutdown）
+        let request = match queue.pop_request(100, &shutdown) {
+            Ok(req) => req,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("shutdown") {
+                    log::info!("Queue listener received shutdown signal");
+                    break;
+                }
+                if msg.contains("timeout") {
+                    // 超时，检查 shutdown 后继续
+                    if shutdown.load(Ordering::SeqCst) {
+                        log::info!("Queue listener shutdown (timeout path)");
+                        break;
+                    }
+                    continue;
+                }
+                log::error!("Queue pop_request error: {e}");
+                break;
+            }
+        };
+
+        let client_id = request.client_id;
+        let command_str = request.command_str().to_string();
+
+        log::debug!("Queue listener: processing command from client {client_id}: {command_str}");
+
+        // 调用 dispatch_command（内部获取 ServerState 锁）
+        let response = dispatch_command(&command_str, &state);
+
+        // 更新指标
+        {
+            let server_state = state.lock().unwrap();
+            server_state.metrics.requests_total.inc();
+            snapshot_metrics(&server_state);
+        }
+
+        // 将响应写回响应队列
+        if let Err(e) = queue.push_response(client_id, &response) {
+            log::error!("Queue push_response error for client {client_id}: {e}");
+            // 即使写回失败也继续处理下一个请求
+        }
+    }
+
+    log::info!("Queue listener thread stopped");
 }
 
 /// 处理单个客户端连接（保留接口兼容性，当前未使用）。
